@@ -11,29 +11,33 @@ Target: classic ESP32 DevKit / ESP32-WROOM-32. Verify flash size and existing OT
 - mDNS URL on the router LAN: `http://edsoft.local/` (where supported).
 - Both AP and station interfaces remain enabled after WiFiManager provisioning.
 
-On first boot, WiFiManager may show its credential portal. Connect to `Edsoft-ESP32-OTA`, enter the home router credentials, and let it reconnect. The firmware then restarts/keeps the permanent AP alongside the router connection. If no router is configured within the portal timeout, the AP remains available for local access; AI requests still need a working internet route on the phone.
+On first boot, WiFiManager may show its credential portal. Connect to `Edsoft-ESP32-OTA`, enter the home router credentials, and let it reconnect. If no router is configured within the portal timeout, the AP remains available for local access. AI requests require the phone to have internet access (for example, cellular data while connected to the ESP32 AP, if the phone supports that routing).
 
 ## OTA compatibility
 
-The upload page remains at `/update`, uses `POST /update`, and sends the multipart file field named `update`, matching the user's existing OTA uploader. It uses Arduino `Update` and does not intentionally change the OTA upload protocol.
+The upload page remains at `/update`, uses `POST /update`, and sends the multipart file field named `update`, matching the existing OTA uploader.
 
-**Do not flash until compatibility is confirmed.** OTA application uploads do not normally rewrite the partition table, but the new app must fit the inactive OTA app partition in the partition table already installed on the device. The source photo cannot establish flash size or partition layout. The existing working OTA sketch proves that OTA is enabled, not that this larger application fits. If uncertain, do not install until you can identify the current partition scheme or recover by USB serial.
+**Do not flash until compatibility is confirmed.** The new app must fit the inactive OTA application partition in the partition table already installed on the device. The board photo cannot establish flash size or partition layout. If uncertain, do not install until the current partition scheme is identified or USB serial recovery is available.
 
 ## Build on GitHub (no laptop)
 
 1. Open repository → Actions.
 2. Open **Build Lucy AI ESP32 firmware** and wait for success.
 3. Download the `lucy-ai-esp32-firmware` artifact ZIP.
-4. In iPhone Files, extract it and select `lucy-ai-esp32dev.bin`.
+4. Extract it and select `lucy-ai-esp32dev.bin`.
 5. Join `Edsoft-ESP32-OTA`, open `http://192.168.4.1/update`, select the binary and upload.
 6. Keep the ESP32 powered. Rejoin the AP after reboot.
 
-## AI backend
+## OpenRouter backend setup
 
-Deploy `worker/worker.js` as a Cloudflare Worker and add the Worker secret `OPENAI_API_KEY`. Never commit the key to GitHub or embed it in firmware. In Lucy AI → AI settings, save the deployed HTTPS Worker URL.
+Deploy `worker/worker.js` as a Cloudflare Worker. In Cloudflare Worker → Settings → Variables and Secrets, add a **Secret** named `OPENROUTER_API_KEY` with your newly rotated OpenRouter key. Do not commit the key to GitHub, put it in the web page, or embed it in firmware.
 
-The Worker permits browser origins `http://192.168.4.1` and `http://edsoft.local`. CORS is not authentication. Before exposing this beyond personal testing, add authenticated sessions/device tokens, rate limits, abuse controls and usage budgets. OpenAI API billing is separate from ChatGPT subscriptions.
+Optional: add a plain-text variable `OPENROUTER_MODEL` to choose a model available to your OpenRouter account. The default is `openai/gpt-4.1-mini`; verify availability and pricing in OpenRouter before use.
+
+In Lucy AI → AI settings, save the deployed HTTPS Worker URL. The Worker calls `https://openrouter.ai/api/v1/chat/completions`.
+
+The Worker currently allows browser origins `http://192.168.4.1` and `http://edsoft.local`. CORS is not authentication. Before exposing this beyond personal testing, add authenticated sessions/device tokens, rate limiting and usage budgets.
 
 ## Internet note
 
-AP+STA keeps the ESP32 connected to the router while it hosts its own AP. It does not automatically route the router's internet to AP clients. The phone may use cellular data for the Worker while connected to the ESP32 AP; if iOS does not route it, use a supported internet bridge or a router-connected phone arrangement.
+AP+STA keeps the ESP32 connected to the router while it hosts its own AP. It does not automatically route the router's internet to AP clients. The phone may use cellular data for the Worker while connected to the ESP32 AP; iOS carrier/Wi-Fi routing behavior can vary.
