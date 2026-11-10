@@ -1,16 +1,20 @@
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "http://192.168.4.1",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-  "Vary": "Origin"
-};
+const ALLOWED_ORIGINS = new Set([
+  "http://192.168.4.1",
+  "http://edsoft.local"
+]);
 
 export default {
   async fetch(request, env) {
-    const origin = request.headers.get("Origin");
-    if (origin !== "http://192.168.4.1") {
+    const origin = request.headers.get("Origin") || "";
+    if (!ALLOWED_ORIGINS.has(origin)) {
       return new Response("Forbidden origin", { status: 403 });
     }
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": origin,
+      "Access-Control-Allow-Methods": "POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+      "Vary": "Origin"
+    };
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
@@ -20,7 +24,6 @@ export default {
     if (!env.OPENAI_API_KEY) {
       return Response.json({ error: "Server API key is not configured" }, { status: 503, headers: corsHeaders });
     }
-
     try {
       const body = await request.json();
       const messages = body?.messages;
@@ -31,9 +34,8 @@ export default {
       }
       const total = messages.reduce((n, m) => n + m.content.length, 0);
       if (total > 12000) {
-        return Response.json({ error: "Conversation is too long; clear the chat and retry." }, { status: 413, headers: corsHeaders });
+        return Response.json({ error: "Conversation too long; clear the chat and retry." }, { status: 413, headers: corsHeaders });
       }
-
       const upstream = await fetch("https://api.openai.com/v1/responses", {
         method: "POST",
         headers: {
@@ -42,14 +44,14 @@ export default {
         },
         body: JSON.stringify({
           model: "gpt-4.1-mini",
-          instructions: "You are Lucy, a friendly, clear, helpful AI companion. Reply in the language used by the user. Keep answers concise unless asked for detail.",
+          instructions: "You are Lucy, a friendly, clear and helpful AI companion. Reply in the language used by the user. Be concise unless asked for detail.",
           input: messages,
           max_output_tokens: 700
         })
       });
       const data = await upstream.json();
       if (!upstream.ok) {
-        console.error("OpenAI upstream error", upstream.status, data?.error?.type || "");
+        console.error("OpenAI error", upstream.status, data?.error?.type || "");
         return Response.json({ error: "AI provider error (" + upstream.status + "). Check API billing and model access." }, { status: 502, headers: corsHeaders });
       }
       const reply = (data.output || []).flatMap(x => x.content || [])
