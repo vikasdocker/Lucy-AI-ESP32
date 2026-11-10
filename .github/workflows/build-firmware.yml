@@ -1,0 +1,36 @@
+name: Build Lucy AI ESP32 firmware
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build ESP32 firmware
+        uses: platformio/platformio-action@v1
+        with:
+          platformio-version: latest
+          run-command: run
+          project-dir: .
+
+      - name: Stage firmware
+        run: |
+          mkdir -p release
+          cp .pio/build/esp32dev/firmware.bin release/lucy-ai-esp32dev.bin
+          sha256sum release/lucy-ai-esp32dev.bin > release/SHA256SUMS.txt
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lucy-ai-esp32-firmware
+          path: release/
+          retention-days: 30
