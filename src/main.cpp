@@ -7,7 +7,7 @@
 #include <Update.h>
 
 static const char *AP_SSID = "Edsoft-ESP32-OTA";
-static const char *AP_PASSWORD = "LucyAI123"; // Reconnect your phone using this password.
+static const char *AP_PASSWORD = "Intel2023#"; // Reconnect your phone using this password.
 static const char *MDNS_HOST = "edsoft";
 
 AsyncWebServer server(80);
