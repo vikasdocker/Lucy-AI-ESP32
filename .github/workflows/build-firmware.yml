@@ -15,12 +15,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build ESP32 firmware
-        uses: platformio/platformio-action@v1
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          platformio-version: latest
-          run-command: run
-          project-dir: .
+          python-version: "3.12"
+
+      - name: Install PlatformIO
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install platformio
+
+      - name: Build ESP32 firmware
+        run: |
+          . .venv/bin/activate
+          pio run -e esp32dev
 
       - name: Stage firmware
         run: |
