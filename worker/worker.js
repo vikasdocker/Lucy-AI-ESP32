@@ -21,9 +21,10 @@ export default {
     if (request.method !== "POST") {
       return Response.json({ error: "POST required" }, { status: 405, headers: corsHeaders });
     }
-    if (!env.OPENAI_API_KEY) {
-      return Response.json({ error: "Server API key is not configured" }, { status: 503, headers: corsHeaders });
+    if (!env.OPENROUTER_API_KEY) {
+      return Response.json({ error: "OpenRouter server secret is not configured" }, { status: 503, headers: corsHeaders });
     }
+
     try {
       const body = await request.json();
       const messages = body?.messages;
@@ -36,30 +37,37 @@ export default {
       if (total > 12000) {
         return Response.json({ error: "Conversation too long; clear the chat and retry." }, { status: 413, headers: corsHeaders });
       }
-      const upstream = await fetch("https://api.openai.com/v1/responses", {
+
+      const upstream = await fetch("https://openrouter.ai/api/v1/chat/completions", {
         method: "POST",
         headers: {
-          "Authorization": "Bearer " + env.OPENAI_API_KEY,
-          "Content-Type": "application/json"
+          "Authorization": "Bearer " + env.OPENROUTER_API_KEY,
+          "Content-Type": "application/json",
+          "HTTP-Referer": "https://lucy-ai-esp32.pages.dev",
+          "X-Title": "Lucy AI ESP32"
         },
         body: JSON.stringify({
-          model: "gpt-4.1-mini",
-          instructions: "You are Lucy, a friendly, clear and helpful AI companion. Reply in the language used by the user. Be concise unless asked for detail.",
-          input: messages,
-          max_output_tokens: 700
+          model: env.OPENROUTER_MODEL || "openai/gpt-4.1-mini",
+          messages: [
+            { role: "system", content: "You are Lucy, a friendly, clear and helpful AI companion. Reply in the language used by the user. Be concise unless asked for detail." },
+            ...messages
+          ],
+          max_tokens: 700
         })
       });
+
       const data = await upstream.json();
       if (!upstream.ok) {
-        console.error("OpenAI error", upstream.status, data?.error?.type || "");
-        return Response.json({ error: "AI provider error (" + upstream.status + "). Check API billing and model access." }, { status: 502, headers: corsHeaders });
+        console.error("OpenRouter error", upstream.status, data?.error?.code || data?.error?.message || "unknown");
+        return Response.json({ error: "OpenRouter provider error (" + upstream.status + "). Check your secret, credits and model access." }, { status: 502, headers: corsHeaders });
       }
-      const reply = (data.output || []).flatMap(x => x.content || [])
-        .filter(x => x.type === "output_text").map(x => x.text || "").join("");
-      if (!reply) return Response.json({ error: "AI returned an empty response" }, { status: 502, headers: corsHeaders });
+      const reply = data?.choices?.[0]?.message?.content;
+      if (typeof reply !== "string" || !reply.trim()) {
+        return Response.json({ error: "OpenRouter returned an empty or unsupported response" }, { status: 502, headers: corsHeaders });
+      }
       return Response.json({ reply }, { headers: { ...corsHeaders, "Cache-Control": "no-store" } });
     } catch (err) {
-      console.error("Worker error", err);
+      console.error("Worker request failed", err?.name || "Error");
       return Response.json({ error: "Invalid request or temporary server error" }, { status: 500, headers: corsHeaders });
     }
   }
