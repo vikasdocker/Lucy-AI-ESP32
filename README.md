@@ -1,45 +1,39 @@
-# Lucy AI – ESP32 Mobile Chatbot
+# Lucy AI – ESP32 AP+STA Chatbot
 
-Firmware target: classic ESP32 DevKit / ESP32-WROOM-32 (4 MB flash assumed).
+Target: classic ESP32 DevKit / ESP32-WROOM-32. Verify flash size and existing OTA partition compatibility before installing.
 
-## What it does
+## Wi-Fi behavior
 
-- Creates a WPA2 Wi-Fi access point: `Lucy_AI`
-- Gateway: `192.168.4.1`
-- Serves a mobile chatbot UI at `http://192.168.4.1/`
-- Provides an OTA firmware update page at `http://192.168.4.1/update`
-- Calls a secure Cloudflare Worker proxy; the OpenAI key is never stored on the ESP32.
+- Permanent AP SSID: `Edsoft-ESP32-OTA`
+- AP password: `LucyAI123`
+- AP URL: `http://192.168.4.1/`
+- Optional router connection through WiFiManager.
+- mDNS URL on the router LAN: `http://edsoft.local/` (where supported).
+- Both AP and station interfaces remain enabled after WiFiManager provisioning.
 
-## Build without a laptop
+On first boot, WiFiManager may show its credential portal. Connect to `Edsoft-ESP32-OTA`, enter the home router credentials, and let it reconnect. The firmware then restarts/keeps the permanent AP alongside the router connection. If no router is configured within the portal timeout, the AP remains available for local access; AI requests still need a working internet route on the phone.
 
-GitHub Actions builds the firmware after every push to the default branch. On GitHub mobile/web:
-1. Open this repository → Actions.
-2. Open **Build Lucy AI ESP32 firmware** and wait for a green successful run.
-3. Open the run → Artifacts → download `lucy-ai-esp32-firmware`.
-4. Extract the ZIP in the iPhone Files app. It contains `lucy-ai-esp32dev.bin`.
+## OTA compatibility
 
-## Important hardware / OTA warning
+The upload page remains at `/update`, uses `POST /update`, and sends the multipart file field named `update`, matching the user's existing OTA uploader. It uses Arduino `Update` and does not intentionally change the OTA upload protocol.
 
-The board photo appears to show an ESP32-WROOM-32 DevKit, but the exact flash size and the currently installed firmware's partition table cannot be read from the photo. The project uses an OTA-capable 4 MB partition layout. Do NOT upload this firmware over the existing OTA page until you have confirmed the existing firmware supports compatible OTA application partitions and the board has 4 MB flash. A wrong partition layout can make OTA fail or require USB serial recovery. If the existing firmware is not known, use a USB-serial programmer (which normally requires a computer) for the first flash.
+**Do not flash until compatibility is confirmed.** OTA application uploads do not normally rewrite the partition table, but the new app must fit the inactive OTA app partition in the partition table already installed on the device. The source photo cannot establish flash size or partition layout. The existing working OTA sketch proves that OTA is enabled, not that this larger application fits. If uncertain, do not install until you can identify the current partition scheme or recover by USB serial.
 
-## Install
+## Build on GitHub (no laptop)
 
-1. Power the board.
-2. Connect phone Wi-Fi to `Lucy_AI`; password: `LucyAI123`.
-3. Open `http://192.168.4.1/`.
-4. Open **Firmware update** at `http://192.168.4.1/update` only after confirming OTA compatibility.
-5. Select `lucy-ai-esp32dev.bin` and upload. Keep power connected.
+1. Open repository → Actions.
+2. Open **Build Lucy AI ESP32 firmware** and wait for success.
+3. Download the `lucy-ai-esp32-firmware` artifact ZIP.
+4. In iPhone Files, extract it and select `lucy-ai-esp32dev.bin`.
+5. Join `Edsoft-ESP32-OTA`, open `http://192.168.4.1/update`, select the binary and upload.
+6. Keep the ESP32 powered. Rejoin the AP after reboot.
 
-Change the default AP password in `src/main.cpp` before distributing or using the device in an untrusted environment.
+## AI backend
 
-## Configure the AI backend
+Deploy `worker/worker.js` as a Cloudflare Worker and add the Worker secret `OPENAI_API_KEY`. Never commit the key to GitHub or embed it in firmware. In Lucy AI → AI settings, save the deployed HTTPS Worker URL.
 
-1. Create a Cloudflare Worker using `worker/worker.js` as its code.
-2. Add a Worker secret named `OPENAI_API_KEY` with your OpenAI API key. Never put this key in GitHub source, firmware, or the browser.
-3. Deploy the Worker and copy its HTTPS `workers.dev` URL.
-4. Connect the phone to Lucy_AI, open `http://192.168.4.1/`, tap **AI settings**, paste the Worker URL, and save.
-5. Send a message. The phone needs mobile data while connected to the ESP32 access point. On some phones, the Wi-Fi network without internet may prevent internet requests; if so, use AP+STA mode with an internet-connected router or a separate network bridge.
+The Worker permits browser origins `http://192.168.4.1` and `http://edsoft.local`. CORS is not authentication. Before exposing this beyond personal testing, add authenticated sessions/device tokens, rate limits, abuse controls and usage budgets. OpenAI API billing is separate from ChatGPT subscriptions.
 
-The Worker only accepts browser requests whose Origin is `http://192.168.4.1`. CORS is not authentication; for public deployment add an authenticated device/session token, rate limiting, abuse controls, and spend limits. This starter Worker has basic payload validation but no per-user authentication.
+## Internet note
 
-OpenAI API billing is separate from ChatGPT subscriptions.
+AP+STA keeps the ESP32 connected to the router while it hosts its own AP. It does not automatically route the router's internet to AP clients. The phone may use cellular data for the Worker while connected to the ESP32 AP; if iOS does not route it, use a supported internet bridge or a router-connected phone arrangement.
