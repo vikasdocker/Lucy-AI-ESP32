@@ -317,6 +317,8 @@ const char *offlineReply(const char *input) {
   return "I am here! Try hello, joke, time, or how are you.";
 }
 
+void handleRtcSetCommand(const char *line);
+
 void handleSerialConsole() {
   while (Serial.available()) {
     char c = static_cast<char>(Serial.read());
@@ -324,9 +326,13 @@ void handleSerialConsole() {
     if (c == '\n') {
       serialLine[serialLength] = '\0';
       if (serialLength) {
-        Serial.print("You: "); Serial.println(serialLine);
-        Serial.print("Lucy: "); Serial.println(offlineReply(serialLine));
-        if (screen == Screen::COMPANION) showCompanion(offlineReply(serialLine));
+        if (strncmp(serialLine, "SETTIME ", 8) == 0) {
+          handleRtcSetCommand(serialLine);
+        } else {
+          Serial.print("You: "); Serial.println(serialLine);
+          Serial.print("Lucy: "); Serial.println(offlineReply(serialLine));
+          if (screen == Screen::COMPANION) showCompanion(offlineReply(serialLine));
+        }
       }
       serialLength = 0;
     } else if (serialLength < sizeof(serialLine) - 1) {
