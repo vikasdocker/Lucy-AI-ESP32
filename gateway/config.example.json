@@ -1,0 +1,16 @@
+{
+  "port": 8788,
+  "bind": "127.0.0.1",
+  "token": "replace-with-a-long-random-token (node setup.js generates one)",
+  "ollamaUrl": "http://127.0.0.1:11434",
+  "model": "qwen2.5:7b",
+  "timeoutMs": 90000,
+  "rateLimit": {
+    "windowMs": 60000,
+    "max": 60
+  },
+  "maxConcurrent": 2,
+  "maxBodyBytes": 65536,
+  "maxMessages": 20,
+  "maxCharsPerMessage": 4000
+}
