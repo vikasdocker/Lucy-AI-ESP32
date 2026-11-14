@@ -14,9 +14,11 @@
 #include "intent_api.h"
 #include "markov_api.h"
 
-// Lucy Offline OS v0.1 — classic ESP32 DevKit V1, SSD1306 128x64.
+// Lucy Offline OS v0.2 — classic ESP32 DevKit V1, SSD1306 128x64.
 // Fork addition: WiFi AP web console for headless testing (mirrors the screen,
 // injects button presses, chats with the offline brain). No internet, no cloud, no STA.
+// v0.2.1: premium 1-bit UI, sans-serif (Helvetica) type system, glyph "emoji"
+// plus SHOT/SCREEN serial hooks so the screen can be verified headlessly.
 
 static constexpr uint8_t PIN_BTN_UP = 16;
 static constexpr uint8_t PIN_BTN_SELECT = 17;
@@ -81,35 +83,382 @@ const char *languageName(Language value) {
   }
 }
 
+// ===========================================================================
+// THEME — the 1-bit "premium" OLED look.
+//
+// The SSD1306 is a 128x64 monochrome panel driven by a fixed ASCII bitmap font:
+// there is no Unicode/emoji glyph set on the device, so sending a real emoji
+// character would render as nothing or garbage. Every "emoji" below is
+// therefore *drawn*: six 8x8 hand-made glyphs (one bit per pixel) plus vector
+// shapes for clock, sliders, sun, moon, wifi bars and toggles.
+//
+// Rules that make a 1-bit screen look deliberate instead of cramped:
+//   * 11px status bar, dotted hairlines instead of solid rules
+//   * 3px-radius rounded frames/pills for every container
+//   * selection = filled pill, with glyph and label inverted (draw color 0)
+//   * only two type sizes: 5x7 for meta, 6x10 for content
+// ===========================================================================
+
+// Type system. The old 5x7/6x10 bitmap faces are cramped and harsh on a 1-bit
+// panel; U8g2's proportional Helvetica is smoother, spaces naturally, and still
+// fits 128px. Only these faces are used anywhere in the firmware — change a
+// macro here rather than a call site.
+//
+//   FONT_TITLE  bold sans — section headers and the selected row (weight = hierarchy)
+//   FONT_BODY   regular sans — content lines, list rows
+//   FONT_META   regular sans 8px — hints, badges, bubble text, secondary values
+//   FONT_BIG    geometric sans display face for the clock digits
+//
+// Both body faces are 8px: with Helvetica, weight and letter-spacing carry the
+// hierarchy instead of a second size, which keeps every baseline on the grid.
+#define FONT_TITLE u8g2_font_helvB08_tf
+#define FONT_BODY u8g2_font_helvR10_tf
+#define FONT_META u8g2_font_helvR08_tf
+#define FONT_BIG u8g2_font_logisoso20_tf
+
+enum IconId : uint8_t {
+  ICON_HEART = 0, ICON_DICE, ICON_INFO, ICON_CLOUD, ICON_SMILE, ICON_SPARK,
+  ICON_CLOCK, ICON_SLIDERS, ICON_NONE
+};
+
+// 8x8 glyphs: one byte per row, bit i = pixel column i (LSB = leftmost).
+static const uint8_t GLYPHS[6][8] = {
+  { 0x66, 0xFF, 0xFF, 0xFF, 0x7E, 0x3C, 0x18, 0x00 }, // HEART
+  { 0x7E, 0x81, 0x85, 0x89, 0x91, 0x81, 0x81, 0x7E }, // DICE
+  { 0x3C, 0x42, 0x99, 0x91, 0x91, 0x99, 0x42, 0x3C }, // INFO
+  { 0x18, 0x3C, 0x7E, 0xFF, 0xFF, 0xFF, 0x7E, 0x00 }, // CLOUD
+  { 0x3C, 0x42, 0xA5, 0x81, 0xA5, 0x99, 0x42, 0x3C }, // SMILE
+  { 0x00, 0x08, 0x1C, 0x7F, 0x1C, 0x08, 0x00, 0x00 }, // SPARK
+};
+
+void drawIcon(uint8_t id, int16_t x, int16_t y, uint8_t color = 1) {
+  display.setDrawColor(color);
+  if (id == ICON_CLOCK) {
+    display.drawCircle(x + 3, y + 4, 3);
+    display.drawLine(x + 3, y + 4, x + 3, y + 1);
+    display.drawLine(x + 3, y + 4, x + 6, y + 4);
+  } else if (id == ICON_SLIDERS) {
+    display.drawHLine(x, y + 1, 8);
+    display.drawHLine(x, y + 6, 8);
+    display.drawDisc(x + 2, y + 1, 1);
+    display.drawDisc(x + 5, y + 6, 1);
+  } else if (id < 6) {
+    for (uint8_t row = 0; row < 8; row++) {
+      const uint8_t bits = GLYPHS[id][row];
+      for (uint8_t col = 0; col < 8; col++) {
+        if (bits & (1u << col)) display.drawPixel(x + col, y + row);
+      }
+    }
+  }
+  display.setDrawColor(1);
+}
+
+// Hairline made of single pixels: lighter than drawHLine on OLED, and it reads
+// as "designed" rather than "default".
+void drawDottedHLine(int16_t x, int16_t y, int16_t w) {
+  for (int16_t i = 0; i < w; i += 2) display.drawPixel(x + i, y);
+}
+
+void drawStrFit(int16_t x, int16_t y, const char *text, int16_t maxW);
+
 void drawCentered(const char *text, uint8_t y) {
-  int16_t x = (128 - display.getStrWidth(text)) / 2;
+  const int16_t w = display.getStrWidth(text);
+  if (w > 126) {  // proportional widths: measure before centering, never clip
+    drawStrFit(1, y, text, 126);
+    return;
+  }
+  int16_t x = (128 - w) / 2;
   if (x < 0) x = 0;
   display.drawStr(x, y, text);
 }
 
-void drawHeader(const char *title) {
-  display.setFont(u8g2_font_6x10_tf);
-  display.drawStr(2, 9, title);
-  display.drawHLine(0, 12, 128);
-}
-
-void drawFooter(const char *text) {
-  display.drawHLine(0, 54, 128);
-  display.setFont(u8g2_font_5x8_tf);
-  display.drawStr(2, 63, text);
-}
-
-void drawEyes(uint32_t now) {
-  const bool blink = (now % 4700U) < 140U;
-  const uint8_t eyeH = blink ? 3 : 18;
-  display.drawRBox(31, 20 + (18 - eyeH) / 2, 25, eyeH, 7);
-  display.drawRBox(72, 20 + (18 - eyeH) / 2, 25, eyeH, 7);
-  if (!blink) {
-    display.setDrawColor(0);
-    display.drawDisc(43, 29, 3);
-    display.drawDisc(84, 29, 3);
-    display.setDrawColor(1);
+int16_t spacedWidth(const char *text, uint8_t track) {
+  char one[2] = {0, 0};
+  int16_t w = 0;
+  for (const char *p = text; *p; p++) {
+    one[0] = *p;
+    w += display.getStrWidth(one);
+    if (p[1]) w += track;
   }
+  return w;
+}
+
+// Letter-spaced uppercase: the single cheapest "premium" cue on a small panel.
+void drawSpaced(int16_t x, int16_t y, const char *text, uint8_t track) {
+  char one[2] = {0, 0};
+  for (const char *p = text; *p; p++) {
+    one[0] = *p;
+    display.drawStr(x, y, one);
+    x += display.getStrWidth(one) + track;
+  }
+}
+
+void drawSpacedCentered(int16_t y, const char *text, uint8_t track) {
+  int16_t x = (128 - spacedWidth(text, track)) / 2;
+  if (x < 0) x = 0;
+  drawSpaced(x, y, text, track);
+}
+
+void drawHeader(const char *title) {
+  display.setFont(FONT_TITLE);
+  drawSpaced(3, 9, title, 1);
+  drawDottedHLine(0, 12, 128);
+}
+
+// Single-line text that must never overrun its column: truncate with "..".
+// Proportional fonts make widths data-dependent, so dynamic text (user lines,
+// model titles, settings values) has to be measured, not assumed.
+void drawStrFit(int16_t x, int16_t y, const char *text, int16_t maxW) {
+  char buf[80];
+  strncpy(buf, text, sizeof(buf) - 4);
+  buf[sizeof(buf) - 4] = '\0';
+  if (display.getStrWidth(buf) <= maxW) {
+    display.drawStr(x, y, buf);
+    return;
+  }
+  size_t n = strlen(buf);
+  while (n > 0) {
+    buf[n] = '\0';
+    char probe[84];
+    snprintf(probe, sizeof(probe), "%s..", buf);
+    if (display.getStrWidth(probe) <= maxW) {
+      display.drawStr(x, y, probe);
+      return;
+    }
+    n--;
+  }
+}
+
+// Left hint plus an optional right-aligned action. The left half is measured
+// against the space the right half leaves, so the two can never collide.
+// Measured on device: "BACK"=29, "UP next SEL open"=88, "UP lang SEL sound"=91.
+void drawFooter(const char *left, const char *right = nullptr) {
+  drawDottedHLine(0, 53, 128);
+  display.setFont(FONT_META);
+  int16_t avail = 122;
+  if (right && *right) {
+    const int16_t rw = display.getStrWidth(right);
+    display.drawStr(126 - rw, 62, right);
+    avail = 126 - rw - 5;
+  }
+  if (left && *left && avail > 12) drawStrFit(3, 62, left, avail);
+}
+
+// Signal bars driven by the real RSSI, so it is live information, not decoration.
+void drawWifiBars(int16_t x, int16_t y, bool connected, int rssi) {
+  uint8_t strength = 0;
+  if (connected) {
+    strength = rssi > -55 ? 4 : rssi > -67 ? 3 : rssi > -78 ? 2 : 1;
+  }
+  for (uint8_t i = 0; i < 4; i++) {
+    const int16_t bx = x + i * 3;
+    const int16_t bh = 2 + i * 2;
+    if (i < strength) {
+      display.drawBox(bx, y + 8 - bh, 2, bh);
+    } else {
+      display.drawPixel(bx, y + 7);
+    }
+  }
+}
+
+// AI bridge state: cloud = PC model reachable plan, chip = local-only brain.
+void drawAiBadge(int16_t x, int16_t y) {
+  if (aiEnabled) {
+    drawIcon(ICON_CLOUD, x, y, 1);
+  } else {
+    display.drawRFrame(x + 1, y + 2, 6, 5, 1);
+    display.drawLine(x, y + 1, x + 7, y + 7);
+  }
+}
+
+void drawSun(int16_t cx, int16_t cy, uint8_t r) {
+  display.drawDisc(cx, cy, r);
+  for (uint8_t a = 0; a < 8; a++) {
+    static const int8_t dx[8] = {1, 1, 0, -1, -1, -1, 0, 1};
+    static const int8_t dy[8] = {0, 1, 1, 1, 0, -1, -1, -1};
+    display.drawPixel(cx + dx[a] * (r + 2), cy + dy[a] * (r + 2));
+  }
+}
+
+void drawMoon(int16_t cx, int16_t cy, uint8_t r) {
+  display.drawDisc(cx, cy, r);
+  display.setDrawColor(0);
+  display.drawDisc(cx + 2, cy - 1, r);
+  display.setDrawColor(1);
+}
+
+enum Mood : uint8_t { MOOD_HAPPY = 0, MOOD_CALM, MOOD_THINK, MOOD_WOW };
+
+// The face is the brand: large soft eyes, mood-driven mouth, real blink.
+//
+// IMPORTANT: U8g2's rounded-box routine takes the radius as-is. If 2*r exceeds
+// w or h, the inner rectangle underflows and the shape floods the screen, so
+// every radius below is clamped by safeRadius().
+uint8_t safeRadius(int16_t w, int16_t h, uint8_t r) {
+  const int16_t limit = (w < h ? w : h) / 2;
+  if (limit < 1) return 0;
+  return (r > static_cast<uint8_t>(limit)) ? static_cast<uint8_t>(limit) : r;
+}
+
+void drawFace(int16_t cx, int16_t cy, uint8_t mood, bool blink) {
+  const int16_t ex = 15;
+  const int16_t ey = cy - 2;
+  const uint8_t eyeH = (mood == MOOD_HAPPY) ? 12 : 16;
+  const uint8_t radius = safeRadius(14, eyeH, 5);
+  for (int8_t s = -1; s <= 1; s += 2) {
+    const int16_t cxx = cx + s * ex;
+    if (blink) {
+      display.drawLine(cxx - 6, ey, cxx, ey + 3);
+      display.drawLine(cxx, ey + 3, cxx + 6, ey);
+      display.drawPixel(cxx, ey + 4);
+    } else {
+      // Solid eye with a 2x2 corner glint: reads as a face, not two rings.
+      display.drawRBox(cxx - 7, ey - eyeH / 2, 14, eyeH, radius);
+      display.setDrawColor(0);
+      const int16_t px = (mood == MOOD_THINK) ? 1 : -3;
+      const int16_t py = (mood == MOOD_THINK) ? -2 : -3;
+      display.drawBox(cxx + px, ey + py, 2, 2);
+      display.setDrawColor(1);
+    }
+  }
+  const int16_t my = cy + 14;
+  if (mood == MOOD_WOW) {
+    display.drawCircle(cx, my - 1, 3);
+  } else if (mood == MOOD_THINK) {
+    display.drawDisc(cx + 3, my - 1, 2);
+  } else if (mood == MOOD_CALM) {
+    display.drawLine(cx - 6, my, cx + 6, my);
+  } else {
+    // Wide shallow parabola: a real smile at 1 bit, not a nose blob.
+    // dy is deepest in the middle and 0 at the corners, so the ends lift.
+    for (int16_t dx = -10; dx <= 10; dx++) {
+      const int16_t dy = static_cast<int16_t>(2 - (dx * dx) / 50);  // 2..0
+      display.drawPixel(cx + dx, my + dy);
+      display.drawPixel(cx + dx, my + dy + 1);
+    }
+  }
+}
+
+void drawToggle(int16_t x, int16_t y, int16_t w, int16_t h, bool on) {
+  display.drawRFrame(x, y, w, h, h / 2);
+  const int16_t kd = h - 4;
+  const int16_t kx = on ? (x + w - kd - 2) : (x + 2);
+  display.drawDisc(kx + kd / 2, y + h / 2, kd / 2);
+}
+
+void drawScrollDots(int16_t x, int16_t y, uint8_t count, uint8_t index) {
+  for (uint8_t i = 0; i < count; i++) {
+    const int16_t dy = y + i * 6;
+    if (i == index) display.drawRBox(x, dy, 4, 3, 1);
+    else display.drawPixel(x + 1, dy + 1);
+  }
+}
+
+// Greedy word wrap for the bubble text. Bounded output, never overflows.
+uint8_t wrapText(const char *text, char out[][40], uint8_t maxLines, int16_t maxWidth) {
+  uint8_t line = 0;
+  int16_t w = 0;
+  size_t oi = 0;
+  out[0][0] = '\0';
+  const char *p = text;
+  bool truncated = false;
+  while (*p && line < maxLines) {
+    while (*p == ' ') p++;
+    if (!*p) break;
+    const char *ws = p;
+    while (*p && *p != ' ') p++;
+    size_t wl = static_cast<size_t>(p - ws);
+    char word[40];
+    if (wl > sizeof(word) - 1) wl = sizeof(word) - 1;
+    memcpy(word, ws, wl);
+    word[wl] = '\0';
+    const int16_t ww = display.getStrWidth(word);
+    const int16_t sep = oi ? display.getStrWidth(" ") : 0;
+    if (oi > 0 && w + sep + ww > maxWidth) {
+      out[line][oi] = '\0';
+      if (line + 1 >= maxLines) {
+        truncated = true;
+        break;
+      }
+      line++;
+      oi = 0;
+      w = 0;
+      out[line][0] = '\0';
+    }
+    if (oi > 0) {
+      out[line][oi++] = ' ';
+      w += sep;
+    }
+    for (size_t i = 0; i < wl && oi < 39; i++) out[line][oi++] = word[i];
+    out[line][oi] = '\0';
+    w += ww;
+    if (line + 1 >= maxLines && *p) {
+      // Peek: another word may still fit, the loop decides.
+    }
+  }
+  if (truncated && oi + 3 < 39) {
+    out[line][oi++] = '.';
+    out[line][oi++] = '.';
+    out[line][oi++] = '.';
+    out[line][oi] = '\0';
+  }
+  return static_cast<uint8_t>(line + 1);
+}
+
+// Rounded message bubble. Returns its height so callers can stack them.
+int16_t drawBubble(int16_t x, int16_t y, int16_t w, const char *text, uint8_t maxLines) {
+  char lines[4][40];
+  const uint8_t n = wrapText(text, lines, maxLines, w - 8);
+  const int16_t h = n * 9 + 4;
+  display.drawRFrame(x, y, w, h, 3);
+  display.setFont(FONT_META);
+  for (uint8_t i = 0; i < n; i++) display.drawStr(x + 4, y + 10 + i * 9, lines[i]);
+  return h;
+}
+
+void drawStatusBar(bool withBrand, bool withTime) {
+  const bool conn = (WiFi.status() == WL_CONNECTED);
+  drawWifiBars(3, 1, conn, conn ? WiFi.RSSI() : 0);
+  drawAiBadge(18, 1);
+  if (withBrand) {
+    display.setFont(FONT_META);
+    drawSpaced(64 - spacedWidth("LUCY", 2) / 2, 8, "LUCY", 2);
+  }
+  if (withTime) {
+    display.setFont(FONT_META);
+    char t[8] = "--:--";
+    if (rtcReady) {
+      DateTime n = rtc.now();
+      snprintf(t, sizeof(t), "%02d:%02d", n.hour(), n.minute());
+    }
+    display.drawStr(125 - display.getStrWidth(t), 8, t);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Companion chat state, mirrored by serial console, web console and buttons.
+// ---------------------------------------------------------------------------
+char chatUser[96] = "";
+char chatReply[192] = "";
+bool lastReplyFromModel = false;
+uint8_t chatIcon = ICON_SPARK;
+
+uint8_t iconForReply(const char *reply) {
+  if (strstr(reply, "Hello") || strstr(reply, "Namaste") || strstr(reply, "Namaskar") ||
+      strstr(reply, "great")) return ICON_SMILE;
+  if (strstr(reply, "welcome")) return ICON_HEART;
+  if (strstr(reply, "Clock") || strstr(reply, "time")) return ICON_CLOCK;
+  if (strstr(reply, "game")) return ICON_DICE;
+  if (strstr(reply, "Why did")) return ICON_SMILE;
+  return ICON_SPARK;
+}
+
+void setChat(const char *user, const char *reply) {
+  strncpy(chatUser, user ? user : "", sizeof(chatUser) - 1);
+  chatUser[sizeof(chatUser) - 1] = '\0';
+  strncpy(chatReply, reply ? reply : "", sizeof(chatReply) - 1);
+  chatReply[sizeof(chatReply) - 1] = '\0';
+  chatIcon = iconForReply(chatReply);
 }
 
 void saveSettings() {
@@ -173,97 +522,190 @@ bool take(Button &button) {
   return value;
 }
 
+// Boot: logo, wordmark and a progress bar that tracks real init steps.
+void showBoot(uint8_t step, uint8_t total) {
+  display.clearBuffer();
+  display.drawRFrame(0, 0, 128, 64, 5);
+  drawFace(64, 17, MOOD_HAPPY, false);
+  display.setFont(FONT_BODY);
+  drawSpacedCentered(44, "LUCY", 3);
+  display.setFont(FONT_META);
+  drawCentered("OFFLINE COMPANION", 52);
+  display.drawRFrame(34, 55, 60, 5, 2);
+  const int16_t filled = static_cast<int16_t>((56 * step) / total);
+  if (filled > 0) display.drawBox(36, 57, filled, 1);
+  display.sendBuffer();
+}
+
 void showHome() {
   display.clearBuffer();
-  display.setFont(u8g2_font_6x10_tf);
-  display.drawStr(3, 9, "LUCY OS");
-  display.drawHLine(0, 12, 128);
-  drawEyes(millis());
-  display.setFont(u8g2_font_5x8_tf);
-  char status[32];
-  snprintf(status, sizeof(status), "%s  %s", rtcReady ? "RTC" : "NO RTC", sdReady ? "SD OK" : "NO SD");
-  display.drawStr(2, 48, status);
-  display.drawStr(2, 62, "SELECT: Apps   UP: Chat");
+  drawStatusBar(true, true);
+  drawDottedHLine(0, 11, 128);
+  const bool blink = (millis() % 4700U) < 140U;
+  drawFace(64, 24, MOOD_HAPPY, blink);
+  display.setFont(FONT_META);
+  const char *state = "LOCAL BRAIN";
+  if (aiEnabled) state = (WiFi.status() == WL_CONNECTED) ? "AI ONLINE" : "AI READY";
+  drawCentered(state, 51);
+  drawDottedHLine(0, 53, 128);
+  display.drawStr(3, 62, "UP chat");
+  display.drawStr(74, 62, "SEL apps");
   display.sendBuffer();
 }
 
 void showMenu() {
   display.clearBuffer();
-  drawHeader("LUCY APPLICATIONS");
-  display.setFont(u8g2_font_6x10_tf);
+  drawHeader("APPS");
+  display.setFont(FONT_META);
+  char pos[12];
+  snprintf(pos, sizeof(pos), "%u/%u", menuIndex + 1, MENU_COUNT);
+  display.drawStr(125 - display.getStrWidth(pos), 8, pos);
+
+  static const uint8_t icons[MENU_COUNT] = {
+    ICON_HEART, ICON_CLOCK, ICON_DICE, ICON_SLIDERS, ICON_INFO
+  };
   for (uint8_t i = 0; i < 3; i++) {
-    uint8_t item = (menuIndex / 3) * 3 + i;
+    const uint8_t item = static_cast<uint8_t>((menuIndex / 3) * 3 + i);
     if (item >= MENU_COUNT) break;
-    uint8_t y = 25 + i * 13;
-    if (item == menuIndex) {
-      display.drawBox(1, y - 9, 126, 12);
-      display.setDrawColor(0);
-    }
-    display.drawStr(5, y, menuItems[item]);
-    if (item == menuIndex) display.setDrawColor(1);
+    const int16_t y = 14 + i * 13;
+    const bool sel = (item == menuIndex);
+    if (sel) display.drawRBox(1, y, 116, 12, 3);
+    drawIcon(icons[item], 5, y + 2, sel ? 0 : 1);
+    display.setFont(sel ? FONT_TITLE : FONT_BODY);
+    display.setDrawColor(sel ? 0 : 1);
+    display.drawStr(17, y + 10, menuItems[item]);
+    display.setDrawColor(1);
   }
-  drawFooter("UP: Next  SELECT: Open  BACK: Home");
+  drawFooter("UP next SEL open", "BACK");
   display.sendBuffer();
 }
 
 void showClock() {
   display.clearBuffer();
-  drawHeader("CLOCK & DATE");
-  display.setFont(u8g2_font_logisoso20_tf);
+  drawHeader("CLOCK");
   if (rtcReady) {
     DateTime now = rtc.now();
-    char timeText[12];
-    snprintf(timeText, sizeof(timeText), "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
-    drawCentered(timeText, 38);
-    display.setFont(u8g2_font_6x10_tf);
+    if (now.hour() >= 7 && now.hour() < 19) drawSun(114, 22, 3);
+    else drawMoon(114, 22, 4);
+    display.setFont(FONT_BIG);
+    char timeText[8];
+    snprintf(timeText, sizeof(timeText), "%02d:%02d", now.hour(), now.minute());
+    const int16_t tw = display.getStrWidth(timeText);
+    const int16_t tx = (128 - tw) / 2 - 7;
+    display.drawStr(tx, 40, timeText);
+    display.setFont(FONT_META);
+    char secText[4];
+    snprintf(secText, sizeof(secText), "%02d", now.second());
+    display.drawStr(tx + tw + 2, 40, secText);
+    display.setFont(FONT_BODY);
+    static const char *weekday[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
     char dateText[24];
-    snprintf(dateText, sizeof(dateText), "%04d-%02d-%02d", now.year(), now.month(), now.day());
-    drawCentered(dateText, 50);
+    snprintf(dateText, sizeof(dateText), "%s  %04d-%02d-%02d", weekday[now.dayOfTheWeek()],
+             now.year(), now.month(), now.day());
+    drawCentered(dateText, 51);
   } else {
-    drawCentered("RTC NOT FOUND", 34);
-    display.setFont(u8g2_font_5x8_tf);
-    drawCentered("Install DS3231 for offline time", 47);
+    // No DS3231 on the bus: keep the screen composed instead of half-empty.
+    // The hint belongs in the footer row, which already has room for it.
+    display.drawCircle(64, 24, 9);
+    display.drawLine(64, 24, 64, 17);
+    display.drawLine(64, 24, 71, 27);
+    display.drawDisc(64, 24, 1);
+    display.setFont(FONT_BODY);
+    drawCentered("NO RTC", 44);
+    drawFooter("SETTIME via serial", "BACK");
+    display.sendBuffer();
+    return;
   }
-  drawFooter("BACK: Home");
+  drawFooter(nullptr, "BACK");
   display.sendBuffer();
 }
 
 void showCompanion(const char *message = nullptr) {
   display.clearBuffer();
-  drawHeader("LUCY COMPANION");
-  display.setFont(u8g2_font_6x10_tf);
+  drawHeader("COMPANION");
+  drawIcon(chatIcon, 116, 2, 1);
+  const bool hasChat = (chatReply[0] != '\0');
   if (message) {
-    // Small screen: caller supplies short ASCII status text.
-    display.drawUTF8(3, 28, message);
+    display.setFont(FONT_BODY);
+    drawCentered(message, 30);
+    display.setFont(FONT_META);
+    drawCentered("SEL for a demo reply", 44);
+  } else if (!hasChat) {
+    drawFace(64, 24, MOOD_HAPPY, (millis() % 4700U) < 140U);
+    display.setFont(FONT_META);
+    drawCentered("Say hello", 51);
   } else {
-    drawEyes(millis());
-    drawCentered("Talk to me!", 49);
+    // The reply is the hero; the question above it stays one clipped line.
+    display.setFont(FONT_META);
+    char you[72];
+    snprintf(you, sizeof(you), "you: %s", chatUser);
+    drawStrFit(3, 20, you, 122);
+    drawIcon(lastReplyFromModel ? ICON_CLOUD : ICON_SMILE, 3, 23, 1);
+    drawBubble(13, 22, 112, chatReply, 3);
   }
-  drawFooter("UP: Language  SELECT: Demo reply");
+  display.setFont(FONT_META);
+  if (!message && hasChat) {
+    display.drawStr(3, 62, lastReplyFromModel ? "from PC model" : "offline brain");
+  } else if (!message) {
+    display.drawStr(3, 62, "UP lang SEL demo");
+  }
+  display.drawStr(125 - display.getStrWidth("BACK"), 62, "BACK");
   display.sendBuffer();
 }
 
 void showSettings() {
   display.clearBuffer();
   drawHeader("SETTINGS");
-  display.setFont(u8g2_font_6x10_tf);
-  char line[32];
-  snprintf(line, sizeof(line), "Language: %s", languageName(language));
-  display.drawStr(4, 27, line);
-  snprintf(line, sizeof(line), "Voice output: %s", soundEnabled ? "ON" : "OFF");
-  display.drawStr(4, 40, line);
-  drawFooter("UP: Change language  SELECT: Sound");
+  char value[24];
+  // Three rows, no interior rules: the air is what makes a 1-bit list readable.
+  display.setFont(FONT_BODY);
+  display.drawStr(4, 22, "Language");
+  display.setFont(FONT_META);
+  snprintf(value, sizeof(value), "%s", languageName(language));
+  drawStrFit(122 - display.getStrWidth(value), 21, value, 120);
+
+  display.setFont(FONT_BODY);
+  display.drawStr(4, 35, "Sound");
+  drawToggle(100, 27, 24, 10, soundEnabled);
+
+  display.setFont(FONT_BODY);
+  display.drawStr(4, 48, "AI bridge");
+  drawToggle(100, 40, 24, 10, aiEnabled);
+  drawFooter("UP lang SEL sound", "BACK");
   display.sendBuffer();
 }
 
 void showAbout() {
   display.clearBuffer();
-  drawHeader("ABOUT LUCY OS");
-  display.setFont(u8g2_font_6x10_tf);
-  display.drawStr(4, 27, "Offline Companion");
-  display.drawStr(4, 39, "Build: 0.1.0");
-  display.drawStr(4, 51, "ESP32 DevKit V1");
-  drawFooter("BACK: Apps");
+  drawHeader("ABOUT");
+  drawFace(64, 22, MOOD_HAPPY, false);
+  display.setFont(FONT_TITLE);
+  drawSpacedCentered(50, "LUCY OS", 2);
+  display.setFont(FONT_META);
+  drawCentered("v0.2.1 ESP32-D0WD-V3", 62);
+  display.sendBuffer();
+}
+
+void showGames() {
+  display.clearBuffer();
+  drawHeader("GAMES");
+  static const char *names[] = {"Snake", "Tic Tac Toe", "Memory Match"};
+  for (uint8_t i = 0; i < 3; i++) {
+    const int16_t y = 13 + i * 13;
+    const bool sel = (i == gameIndex);
+    if (sel) display.drawRBox(1, y, 116, 12, 3);
+    display.setDrawColor(sel ? 0 : 1);
+    display.drawRBox(5, y + 2, 9, 9, 2);
+    display.setDrawColor(sel ? 1 : 0);
+    display.setFont(FONT_META);
+    char num[2] = {static_cast<char>('1' + i), 0};
+    display.drawStr(8, y + 9, num);
+    display.setDrawColor(sel ? 0 : 1);
+    display.setFont(FONT_BODY);
+    display.drawStr(19, y + 10, names[i]);
+    display.setDrawColor(1);
+  }
+  drawFooter("UP next SEL play", "BACK");
   display.sendBuffer();
 }
 
@@ -287,16 +729,41 @@ void startSnake() {
 
 void showSnake() {
   display.clearBuffer();
-  drawHeader("SNAKE  UP: TURN");
-  display.drawFrame(0, 14, 128, 39);
-  display.drawBox(foodX * 8, 17 + foodY * 5, 4, 4);
+  display.setFont(FONT_META);
+  display.drawStr(3, 9, "SNAKE");
+  drawIcon(ICON_HEART, 60, 1, 1);
+  char score[8];
+  snprintf(score, sizeof(score), "%u", snakeScore);
+  display.drawStr(122 - display.getStrWidth(score), 9, score);
+  display.drawRFrame(0, 12, 128, 43, 3);
+
+  // Apple: a 4px disc with a leaf pixel above it.
+  display.drawDisc(2 + foodX * 8, 15 + foodY * 5 + 2, 2);
+  display.drawPixel(2 + foodX * 8, 12 + foodY * 5);
+
   for (uint8_t i = 0; i < snakeLength; i++) {
-    display.drawBox(snakeX[i] * 8, 17 + snakeY[i] * 5, 5, 4);
+    const int16_t sx = snakeX[i] * 8;
+    const int16_t sy = 17 + snakeY[i] * 5;
+    if (i == 0) {
+      display.drawRBox(sx, sy, 6, 4, 1);
+      display.setDrawColor(0);
+      display.drawPixel(sx + 2, sy + 1);
+      display.drawPixel(sx + 4, sy + 1);
+      display.setDrawColor(1);
+    } else {
+      display.drawBox(sx + 1, sy, 4, 4);
+    }
   }
-  display.setFont(u8g2_font_5x8_tf);
-  char score[20];
-  snprintf(score, sizeof(score), "SCORE %u", snakeScore);
-  display.drawStr(2, 63, snakeOver ? "GAME OVER - SELECT" : score);
+
+  if (snakeOver) {
+    display.drawRBox(26, 22, 76, 22, 3);
+    display.setDrawColor(0);
+    display.setFont(FONT_BODY);
+    drawCentered("GAME OVER", 31);
+    display.setFont(FONT_META);
+    drawCentered("SEL retry", 41);
+    display.setDrawColor(1);
+  }
   display.sendBuffer();
 }
 
@@ -382,6 +849,7 @@ static const char *replyForIntent(int intent) {
 
 const char *offlineReply(const char *input) {
   static char normalized[96];
+  lastReplyFromModel = false;
   size_t n = strlen(input);
   if (n >= sizeof(normalized)) n = sizeof(normalized) - 1;
   for (size_t i = 0; i < n; i++) normalized[i] = static_cast<char>(tolower(static_cast<unsigned char>(input[i])));
@@ -409,7 +877,10 @@ const char *offlineReply(const char *input) {
   // unreachable, or in its retry backoff window.
   if (aiEnabled) {
     const char *ai = aiReply(input);
-    if (ai != nullptr) return ai;
+    if (ai != nullptr) {
+      lastReplyFromModel = true;
+      return ai;
+    }
   }
 
   if (strstr(normalized, "hello") || textHasWord(normalized, "hi") || textHasWord(normalized, "hey") || strstr(normalized, "namaste") || strstr(normalized, "namaskar")) {
@@ -616,6 +1087,43 @@ void handleWifiCommand(const char *line) {
   Serial.println("WiFi: use WIFI status to check; 2.4 GHz networks only");
 }
 
+// ---------------------------------------------------------------------------
+// Headless visual test hooks (see SOP 5.2).
+//   SHOT    hex-dumps the live 128x64 framebuffer so a PC can rebuild the
+//           screen as a PNG without joining Lucy-Setup (which would steal the
+//           uplink of the machine running the check).
+//   SCREEN  jumps straight to a named screen for that capture.
+// Both are read-only: they draw and report, never change settings.
+// ---------------------------------------------------------------------------
+void dumpFramebuffer() {
+  const uint8_t *buf = display.getU8g2()->tile_buf_ptr;
+  Serial.println("SHOT BEGIN 128 64");
+  for (uint16_t i = 0; i < 1024; i++) {
+    if (buf[i] < 0x10) Serial.print('0');
+    Serial.print(buf[i], HEX);
+    if ((i & 31) == 31) Serial.println();
+  }
+  Serial.println("SHOT END");
+}
+
+void jumpToScreen(const char *name) {
+  if (strcmp(name, "home") == 0) { screen = Screen::HOME; showHome(); }
+  else if (strcmp(name, "menu") == 0) { screen = Screen::MENU; menuIndex = 0; showMenu(); }
+  else if (strcmp(name, "clock") == 0) { screen = Screen::CLOCK; showClock(); }
+  else if (strcmp(name, "companion") == 0) { screen = Screen::COMPANION; showCompanion(); }
+  else if (strcmp(name, "settings") == 0) { screen = Screen::SETTINGS; showSettings(); }
+  else if (strcmp(name, "about") == 0) { screen = Screen::ABOUT; showAbout(); }
+  else if (strcmp(name, "games") == 0) { screen = Screen::GAMES; gameIndex = 0; showGames(); }
+  else if (strcmp(name, "snake") == 0) { startSnake(); showSnake(); }
+  else {
+    Serial.println("SCREEN: home|menu|clock|companion|settings|about|games|snake");
+    return;
+  }
+  lastInteraction = millis();
+  Serial.print("SCREEN: ");
+  Serial.println(name);
+}
+
 void handleSerialConsole() {
   while (Serial.available()) {
     char c = static_cast<char>(Serial.read());
@@ -637,12 +1145,33 @@ void handleSerialConsole() {
           markovSaveNow();
         } else if (strcmp(serialLine, "brain reset") == 0) {
           markovReset();
+        } else if (strncmp(serialLine, "MEAS ", 5) == 0) {
+          // Font-metric probe: proportional widths are data-dependent, so ask
+          // the panel instead of guessing layout constants.
+          const char *txt = serialLine + 5;
+          display.setFont(FONT_META);
+          const int16_t m = display.getStrWidth(txt);
+          display.setFont(FONT_BODY);
+          const int16_t b = display.getStrWidth(txt);
+          display.setFont(FONT_TITLE);
+          const int16_t t = display.getStrWidth(txt);
+          Serial.print("MEAS meta=");
+          Serial.print(m);
+          Serial.print(" body=");
+          Serial.print(b);
+          Serial.print(" title=");
+          Serial.println(t);
+        } else if (strcmp(serialLine, "SHOT") == 0) {
+          dumpFramebuffer();
+        } else if (strncmp(serialLine, "SCREEN ", 7) == 0) {
+          jumpToScreen(serialLine + 7);
         } else {
           Serial.print("You: "); Serial.println(serialLine);
           markovLearn(serialLine);           // every message teaches the generator
           const char *reply = offlineReply(serialLine);
+          setChat(serialLine, reply);
           Serial.print("Lucy: "); Serial.println(reply);
-          if (screen == Screen::COMPANION) showCompanion(reply);
+          if (screen == Screen::COMPANION) showCompanion();
         }
       }
       serialLength = 0;
@@ -656,7 +1185,7 @@ void openMenuItem() {
   switch (menuIndex) {
     case 0: screen = Screen::COMPANION; showCompanion(); break;
     case 1: screen = Screen::CLOCK; showClock(); break;
-    case 2: screen = Screen::GAMES; gameIndex = 0; break;
+    case 2: screen = Screen::GAMES; gameIndex = 0; showGames(); break;
     case 3: screen = Screen::SETTINGS; showSettings(); break;
     default: screen = Screen::ABOUT; showAbout(); break;
   }
@@ -736,7 +1265,10 @@ static void handleWebSay() {
   text.trim();
   if (text.isEmpty()) { webServer.send(400, "text/plain", "empty"); return; }
   markovLearn(text.c_str()); // same learning path as the serial console
-  webServer.send(200, "text/plain; charset=utf-8", offlineReply(text.c_str()));
+  const char *reply = offlineReply(text.c_str());
+  setChat(text.c_str(), reply);
+  webServer.send(200, "text/plain; charset=utf-8", reply);
+  if (screen == Screen::COMPANION) showCompanion();
 }
 
 static void webConsoleBegin() {
@@ -797,7 +1329,7 @@ void setup() {
   Serial.begin(115200);
   delay(150);
   Serial.println();
-  Serial.println("Lucy Offline OS v0.1 booting — no internet / no cloud AI");
+  Serial.println("Lucy Offline OS v0.2.1 booting — no internet / no cloud AI");
 
   pinMode(PIN_BTN_UP, INPUT_PULLUP);
   pinMode(PIN_BTN_SELECT, INPUT_PULLUP);
@@ -807,11 +1339,10 @@ void setup() {
   Wire.begin(21, 22);
   display.begin();
   display.setContrast(180);
-  display.clearBuffer();
-  display.setFont(u8g2_font_6x10_tf);
-  drawCentered("LUCY OS", 27);
-  drawCentered("OFFLINE STARTING", 43);
-  display.sendBuffer();
+  for (uint8_t step = 0; step <= 4; step++) {
+    showBoot(step, 4);
+    delay(110);
+  }
 
   prefs.begin("lucy-os", false);
   loadSettings();
@@ -903,18 +1434,10 @@ void loop() {
     if (take(btnUp)) { gameIndex = (gameIndex + 1) % 3; }
     if (take(btnSelect)) {
       if (gameIndex == 0) startSnake();
-      else { showCompanion(gameIndex == 1 ? "Tic Tac Toe: coming soon" : "Memory game: coming soon"); screen = Screen::COMPANION; }
+      else { showCompanion(gameIndex == 1 ? "Tic Tac Toe: soon" : "Memory: soon"); screen = Screen::COMPANION; }
     }
     if (take(btnBack)) { screen = Screen::MENU; showMenu(); }
-    if (millis() - lastFrame > 250) {
-      lastFrame = millis();
-      display.clearBuffer(); drawHeader("GAMES");
-      display.setFont(u8g2_font_6x10_tf);
-      const char *games[] = {"Snake", "Tic Tac Toe", "Memory Match"};
-      display.drawStr(5, 30, games[gameIndex]);
-      drawFooter("UP: Next  SELECT: Play  BACK: Apps");
-      display.sendBuffer();
-    }
+    if (millis() - lastFrame > 250) { lastFrame = millis(); showGames(); }
   } else if (screen == Screen::SNAKE) {
     if (take(btnBack)) { screen = Screen::GAMES; }
     if (snakeOver && take(btnSelect)) startSnake();

@@ -56,8 +56,11 @@ Non-goals: Lucy is not a product, not multi-device, not a cloud service. The dev
 | On-device intent classifier (~17 KB int8, 9 classes, trainable via `tools/train_intent.py`) | ✅ integrated, paraphrases work |
 | Self-learning Markov generator (order-3 char chain + order-2 backoff) | ✅ invents words, persists to SPIFFS, autosaves |
 | Wi-Fi **softAP web console** `Lucy-Setup` → http://192.168.4.1 (framebuffer mirror, virtual buttons, chat box) | ✅ works |
-| RTC (DS3231) clock screen + `SETTIME` | ✅ works |
-| Snake / menus / boot screens | ✅ works |
+| **Premium 1-bit UI (v0.2)** — status bar (live RSSI bars, AI badge, RTC clock), animated face, icon menu, chat bubbles with wrap, iOS-style toggles, boot animation | ✅ works, captured screen-by-screen |
+| **Glyph "emoji"** — eight 8x8 hand-drawn glyphs (heart, dice, info, cloud, smile, spark, vector clock + sliders) | ✅ drawn as pixels; see §4.1a — the panel has **no Unicode font**, real emoji characters cannot render |
+| RTC (DS3231) clock screen + `SETTIME` | ⚠️ **not detected at last check** (`SETTIME` → "RTC not detected"); UI ships a composed no-RTC state. See §9.12. |
+| Snake / menus / boot screens | ✅ works (Snake redrawn: rounded field, apple disc, head with eyes, game-over card) |
+| `SHOT` / `SCREEN <name>` serial hooks (headless visual verification) | ✅ tested — hex-dumps the live framebuffer / jumps screens without joining `Lucy-Setup` |
 | **AI bridge to PC-hosted LLM** (Ollama `qwen2.5:7b`) | ✅ works, configurable |
 | **LAN mode**: `AI host 192.168.4.2 11434` (PC on `Lucy-Setup`) | ✅ wired, not yet live-tested (requires moving this PC's Wi-Fi, which would drop the agent) |
 | **Public mode**: `AI url https://lucy.blueflutex.in` (token + verified TLS, via hotspot) | ✅ **verified end-to-end** — e.g. `What is the capital of Japan?` → `Tokyo…`, ~4–7 s |
@@ -65,6 +68,54 @@ Non-goals: Lucy is not a product, not multi-device, not a cloud service. The dev
 | NVS persistence of AI URL/token/Wi-Fi credentials | ✅ survives reboot |
 | Offline fallback with 30 s circuit breaker | ✅ works — model outage → canned replies, instant |
 | AP+STA coexistence (Lucy keeps `Lucy-Setup` while on the hotspot) | ✅ works |
+
+### 4.1a The display has no emoji — read this before promising any
+
+The SSD1306 is **128×64 at 1 bit** driven by U8g2 with fixed ASCII bitmap fonts. There is no
+Unicode/emoji glyph set in the firmware, so an emoji character sent to `drawStr`/`drawUTF8`
+renders as nothing or as garbage — and the system prompt deliberately keeps model output
+ASCII-only (issue #8). "Emoji" in this UI therefore means **drawn glyphs**:
+
+- `GLYPHS[6][8]` — six 8×8 bitmaps (heart, dice, info, cloud, smile, spark), one byte per
+  row, bit *i* = pixel column *i*. Add one by appending bytes and an `ICON_*` id.
+- Clock and sliders are **vector** glyphs drawn in `drawIcon()`, because at 8×8 the bitmaps
+  read badly.
+- Sun/moon, wifi bars, toggles and the face are vector too.
+
+Two rules for anyone editing the theme:
+
+1. **Clamp rounded-box radii.** `u8g2.drawRBox/RFrame(w, h, r)` does not guard `2r > w|h`;
+   the inner rectangle underflows and the shape floods the screen. Use `safeRadius()`
+   (lands: eyes rendered as full-height bars until this was fixed).
+2. **Selection = filled pill + `setDrawColor(0)`**, and every draw helper must restore
+   color 1 before returning, or the next element inverts by accident.
+
+The face is the brand: `drawFace(cx, cy, mood, blink)` with `MOOD_HAPPY|CALM|THINK|WOW`.
+Keep the mouth a wide shallow **parabola** (`dy = 2 - dx²/50`) — a half-disc reads as a
+nose, and the inverted sign reads as a frown.
+
+### 4.1b Type system — Helvetica, and why positions are measured
+
+The 5×7/6×10 bitmap faces looked cramped and harsh ("stressed"), so v0.2.1 uses U8g2's
+**proportional Helvetica**, defined once as macros in `main.cpp`:
+
+| Macro | Face | Use |
+|---|---|---|
+| `FONT_TITLE` | `helvB08` bold 8px | section headers, selected row |
+| `FONT_BODY` | `helvR10` regular 10px | list rows, labels, clock date |
+| `FONT_META` | `helvR08` regular 8px | hints, badges, bubble text, values |
+| `FONT_BIG` | `logisoso20` | clock digits |
+
+Hierarchy is **weight + size**, and there is no second family. Because Helvetica is
+proportional, string width is data-dependent — never assume `chars × 5`. Two consequences
+that cost a round of layout bugs:
+
+- **Measure, don't guess.** `MEAS <text>` prints the width in all three faces
+  (`MEAS meta=88 body=116 title=88`). Real values on this panel: `"BACK"`=29,
+  `"UP next SEL open"`=88, `"UP lang SEL sound"`=91, `"Companion"`=72 (body).
+- **Fit constrained text.** `drawStrFit()` truncates with `..` to a measured column, and
+  `drawFooter(left, right)` measures the left hint against the space the right action
+  leaves. Do not place a measured string and a right-aligned string by hand — it will clip.
 
 ### 4.2 PC-side services
 
@@ -110,7 +161,7 @@ Copy-Item "$src\ai_client.cpp","$src\ai_api.h","$src\markov.cpp","$src\markov_ap
 python -m esptool --port COM5 write-flash --flash-size detect -z 0x10000 `
     "$dst\build\LucyOffline.ino.bin"
 ```
-Latest build: **1,221,531 B flash (38 % of 3 MB), 206,512 B free RAM**.
+Latest build (v0.2.1 sans UI): **1,230,915 B flash (39 % of 3 MB), 206,200 B free RAM**.
 
 ### 5.2 Serial smoke test (PySerial one-liner used throughout)
 
@@ -120,6 +171,26 @@ Automated:
 ```powershell
 python tools\test_lucy_ai.py COM5     # AI status + 3 chat questions, prints timing
 ```
+
+### 5.2a Seeing the screen without touching the network
+
+The panel is 1-bit and has no readable framebuffer over USB by default, so v0.2 adds two
+serial hooks. They make the UI verifiable on a machine that must stay online — joining
+`Lucy-Setup` to use the web console would drop this PC's uplink (rule 5).
+
+| Command | Effect |
+|---|---|
+| `SCREEN home\|menu\|clock\|companion\|settings\|about\|games\|snake` | jump straight to a screen |
+| `MEAS <text>` | print that string's width in FONT_META / FONT_BODY / FONT_TITLE |
+| `SHOT` | print `SHOT BEGIN 128 64`, 1024 framebuffer bytes as hex (32 lines), then `SHOT END` |
+
+Decoding: byte index `page*128 + col`, bit `b` = pixel row `page*8 + b`, so
+`pixel(col, page*8+b) = (buf[page*128+col] >> b) & 1`. Anything that reproduces that
+mapping (a 20-line Python script, or `lucy_shot.py` in the agent workspace) turns a dump
+into a PNG of the real screen.
+
+Send a chat line *after* `SCREEN companion` to capture the bubble layout; the reply line
+`Lucy: …` is the signal that the frame is ready.
 
 ### 5.3 Web console
 
@@ -226,6 +297,8 @@ That is the 4 MB full backup of the device **as it was before any of this work**
 9. **Cold model load ≈6 s**, warm ≈0.6 s, public round trip ≈1.7–7 s depending on route. This is expected.
 10. **`offline/.pio/`** and `lucy-build/` contain build junk that is git-ignored on purpose.
 11. **`Lucy Gateway` is not auto-started by the hotspot** — the hotspot is a Windows setting, not a task; see §8.1. This is the single most likely cause of "Lucy fell back to offline" after a reboot.
+12. **RTC not detected (2026-11-14, v0.2 flash)** — `SETTIME` answers "Invalid date/time or RTC not detected" and both the home clock and the CLOCK screen show the no-RTC state. The OLED is fine on the same I²C bus, so this is the DS3231 module: not wired to SDA/SCL (GPIO 21/22), unpowered, or absent. **Owner question, not a firmware bug** — the firmware still refuses to invent the time, which is correct. Re-check with `SETTIME YYYY-MM-DD HH:MM:SS` after confirming the module.
+13. **A `SHOT` capture proves pixels, not legibility.** The dumps caught two real UI defects (flooded rounded boxes, a separator crossing a toggle) that looked fine in code. Capture before claiming a visual change works.
 
 ---
 
@@ -264,7 +337,9 @@ That is the 4 MB full backup of the device **as it was before any of this work**
 
 ```
 offline/                         firmware (Arduino-IDE .ino copy of main.cpp lives in lucy-build\)
-  src/main.cpp                   OS, command routing, reply order, web console, buttons, menus
+  src/main.cpp                   OS, command routing, reply order, web console, buttons, menus,
+                                 THEME/GLYPHS block (icons, face, bubbles, toggles) and the
+                                 SHOT/SCREEN headless visual hooks
   src/ai_client.cpp/.h           HTTPS/HTTP client; TLS, token, circuit breaker, 3-turn history
   src/tls_root_ca.h              ISRG X1/X2 pinned roots for TLS verification
   src/markov.cpp/.h              self-learning order-3 word generator
