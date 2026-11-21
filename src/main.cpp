@@ -7,6 +7,12 @@
 #include <Preferences.h>
 #include <DNSServer.h>
 #include <stdarg.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include <atomic>
+#include "../offline/src/lucy_cloud_config.h"
+#include "../offline/src/tls_root_ca.h"
 
 static const char *AP_SSID = "Edsoft-ESP32-OTA";
 static const char *AP_PASSWORD = "Intel2023#";
@@ -123,6 +129,35 @@ void startMdnsIfConnected() {
   }
 }
 
+// One bounded background job; HTTP callbacks never wait for the cloud.
+std::atomic<int> cloudState{0}; // 0 idle, 1 running, 2 ready
+String cloudBody, cloudReply;
+unsigned long cloudRetryAt = 0;
+void cloudTask(void *) {
+  cloudReply = "";
+  if (WiFi.status() == WL_CONNECTED && time(nullptr) >= 1704067200 && strlen(LUCY_DEVICE_TOKEN) >= 24) {
+    WiFiClientSecure tls;
+    tls.setCACert(LUCY_ROOT_CA);
+    tls.setHandshakeTimeout(10);
+    HTTPClient http;
+    if (http.begin(tls, String(LUCY_WORKER_URL) + "/api/chat")) {
+      http.setConnectTimeout(10000); http.setTimeout(26000);
+      http.setReuse(false); http.useHTTP10(true);
+      http.addHeader("Content-Type", "application/json");
+      http.addHeader("x-lucy-token", LUCY_DEVICE_TOKEN);
+      if (http.POST(cloudBody) == 200) {
+        StaticJsonDocument<128> filter; filter["message"]["content"] = true;
+        DynamicJsonDocument doc(2048);
+        if (!deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter)))
+          cloudReply = String(doc["message"]["content"] | "");
+      }
+      http.end();
+    }
+  }
+  cloudState.store(2);
+  vTaskDelete(nullptr);
+}
+
 static const char index_html[] PROGMEM = R"HTML(
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -151,29 +186,24 @@ button:disabled{opacity:.5}.tools{display:flex;justify-content:center;gap:18px;p
 </style></head><body>
 <header><div class="logo">🤖</div><div><h1>Lucy AI</h1><small>ESP32 personal chatbot</small></div></header>
 <main>
-<section id="settings"><b>AI connection settings</b>
-<p><small>Paste your HTTPS Cloudflare Worker URL. The API key stays on the server.</small></p>
-<input id="endpoint" type="url" placeholder="https://your-worker.workers.dev" autocomplete="url">
-<button id="save" type="button">Save connection</button></section>
+
 <div id="status" class="status">ESP32 hotspot is active</div><div id="messages"></div>
 </main>
 <div class="composer"><form id="form"><input id="prompt" autocomplete="off" placeholder="Message Lucy..." maxlength="2000"><button id="send" type="submit">Send</button></form>
-<div class="tools"><a href="#" id="settingsLink">AI settings</a><a href="/wifi">Wi-Fi settings</a><a href="/logs">System logs</a><a href="/info">Diagnostics</a><a href="/update">Firmware update</a><a href="#" id="clear">Clear chat</a></div></div>
+<div class="tools"><a href="/wifi">Wi-Fi settings</a><a href="/logs">System logs</a><a href="/info">Diagnostics</a><a href="/update">Firmware update</a><a href="#" id="clear">Clear chat</a></div></div>
 <script>
 const $=id=>document.getElementById(id),messages=[],box=$("messages");let busy=false;
 function add(text,role){const d=document.createElement("div");d.className="msg "+role;d.textContent=text;box.appendChild(d);window.scrollTo(0,document.body.scrollHeight);return d}
-function getEndpoint(){return localStorage.getItem("lucy_endpoint")||""}
+const WORKER_URL="/api/chat";
+function getEndpoint(){return WORKER_URL}
 async function clientLog(level,message){try{await fetch("/api/client-log",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams({level,message})})}catch(e){}}
-$("endpoint").value=getEndpoint();
-$("settingsLink").onclick=e=>{e.preventDefault();$("settings").style.display=$("settings").style.display==="block"?"none":"block"};
-$("save").onclick=()=>{const value=$("endpoint").value.trim();try{const u=new URL(value);if(u.protocol!=="https:"||value.includes("https://https://"))throw new Error();localStorage.setItem("lucy_endpoint",value);$("settings").style.display="none";add("AI server saved. You can start chatting now.","system");clientLog("INFO","AI Worker URL saved in browser")}catch{add("Enter one valid HTTPS Worker URL (only one https://).","system")}};
 $("clear").onclick=e=>{e.preventDefault();messages.length=0;box.innerHTML="";add("Chat cleared. How can I help?","assistant")};
-add("Hello! I'm Lucy. Configure your AI Worker URL in AI settings to begin.","assistant");
-$("form").onsubmit=async e=>{e.preventDefault();if(busy)return;const text=$("prompt").value.trim();if(!text)return;const url=getEndpoint();if(!url){$("settings").style.display="block";add("Please configure your AI Worker URL in AI settings first.","system");return}
+add("Hello! I'm Lucy. Connect Wi-Fi and start chatting.","assistant");
+$("form").onsubmit=async e=>{e.preventDefault();if(busy)return;const text=$("prompt").value.trim();if(!text)return;const url=getEndpoint();
 $("prompt").value="";add(text,"user");messages.push({role:"user",content:text});busy=true;$("send").disabled=true;const waiting=add("Lucy is thinking…","assistant");const controller=new AbortController();const timeout=setTimeout(()=>controller.abort(),45000);
 clientLog("INFO","AI request started");
-try{const response=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({messages:messages.slice(-16)}),signal:controller.signal});clientLog("INFO","AI Worker HTTP status "+response.status);const data=await response.json();if(!response.ok||typeof data.reply!=="string")throw new Error(data.error||"AI request failed ("+response.status+")");waiting.textContent=data.reply;messages.push({role:"assistant",content:data.reply});clientLog("INFO","AI response received successfully")}
-catch(err){waiting.textContent=err.name==="AbortError"?"The AI request timed out. Please try again.":"I couldn't reach the AI service: "+err.message;clientLog("ERROR",err.name==="AbortError"?"AI request timed out":err.message);if(messages.length&&messages[messages.length-1].role==="user")messages.pop()}
+try{let response=await fetch(url,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams({messages:JSON.stringify({messages:messages.slice(-16),stream:false})}),signal:controller.signal});while(response.status===202){await new Promise(r=>setTimeout(r,250));response=await fetch(url,{signal:controller.signal})}clientLog("INFO","AI Worker HTTP status "+response.status);const data=await response.json();if(!response.ok||typeof data.reply!=="string")throw new Error(data.error||"AI request failed ("+response.status+")");waiting.textContent=data.reply;messages.push({role:"assistant",content:data.reply});clientLog("INFO","AI response received successfully")}
+catch(err){waiting.textContent=/\b(hi|hello|hey)\b/i.test(text)?"Hello! I'm happy to see you.":/joke/i.test(text)?"Why did the computer get cold? It left its Windows open!":"I'm here with you. We can chat again when my connection returns.";clientLog("ERROR",err.name==="AbortError"?"AI request timed out":err.message);if(messages.length&&messages[messages.length-1].role==="user")messages.pop()}
 finally{clearTimeout(timeout);busy=false;$("send").disabled=false;$("prompt").focus()}};
 </script></body></html>
 )HTML";
@@ -270,6 +300,30 @@ void setup() {
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send_P(200, "text/html; charset=utf-8", index_html);
+  });
+  server.on("/api/chat", HTTP_POST, [](AsyncWebServerRequest *request) {
+    int expected=2;
+    cloudState.compare_exchange_strong(expected,0); // reclaim an abandoned completed response
+    expected=0;
+    if (!cloudState.compare_exchange_strong(expected,1)) { request->send(409,"application/json","{\"error\":\"Busy\"}"); return; }
+    if (WiFi.status()!=WL_CONNECTED || (cloudRetryAt && int32_t(millis()-cloudRetryAt)<0) ||
+        !request->hasParam("messages",true) || request->getParam("messages",true)->value().length()>12000) {
+      cloudState.store(0);request->send(503,"application/json","{\"error\":\"Offline\"}");return;
+    }
+    cloudBody=request->getParam("messages",true)->value();
+    if (ESP.getFreeHeap()<80000 || xTaskCreate(cloudTask,"classic-cloud",12288,nullptr,1,nullptr)!=pdPASS) {
+      cloudState.store(0);request->send(503,"application/json","{\"error\":\"Offline\"}");return;
+    }
+    request->send(202,"application/json","{}");
+  });
+  server.on("/api/chat", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (cloudState.load()==1) {request->send(202,"application/json","{}");return;}
+    if (cloudState.load()!=2) {request->send(404,"application/json","{}");return;}
+    const bool ok=cloudReply.length()>0;
+    String body=ok?"{\"reply\":\""+jsonEscape(cloudReply)+"\"}":"{\"error\":\"Offline\"}";
+    cloudRetryAt=ok?0:millis()+30000;
+    cloudBody="";cloudReply="";cloudState.store(0);
+    request->send(ok?200:503,"application/json",body);
   });
   server.on("/wifi", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send_P(200, "text/html; charset=utf-8", wifi_html);
@@ -443,6 +497,7 @@ void loop() {
       logLine("Wi-Fi connected: %s", WiFi.SSID().c_str());
       logLine("Station IP: %s", WiFi.localIP().toString().c_str());
       logLine("Signal strength: %d dBm", WiFi.RSSI());
+      configTime(0, 0, "pool.ntp.org", "time.google.com");
       stopCaptiveDns();
       startMdnsIfConnected();
     } else {

@@ -2,7 +2,9 @@ name: Build Lucy AI ESP32 firmware
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, "clipbot/**" ]
+  pull_request:
+    paths: ["src/**", "platformio.ini", "offline/src/lucy_cloud_config.h", "offline/src/tls_root_ca.h", ".github/workflows/build-firmware.yml"]
   workflow_dispatch:
 
 permissions:

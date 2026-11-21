@@ -19,10 +19,10 @@ const path = require('path');
 const tls = require('tls');
 const { X509Certificate } = require('crypto');
 
-const host = process.argv[2] || 'lucy.blueflutex.in';
+const host = process.argv[2] || 'sparkling-fog-fdc8.vikasshu7.workers.dev';
 const wanted = process.argv.slice(3);
 if (wanted.length === 0) {
-  wanted.push('ISRG Root X1', 'ISRG Root X2');
+  wanted.push('ISRG Root X1', 'ISRG Root X2', 'GTS Root R1', 'GTS Root R4', 'DigiCert Global Root G2');
 }
 
 const found = new Map();
@@ -47,8 +47,8 @@ const body = wanted.map((name) => found.get(name)).join('\n') + '\n';
 const header = `#pragma once
 
 // Trust anchors for https://${host} (Cloudflare edge, Let's Encrypt chain).
-// Both ISRG roots are included so a chain change from X2 to X1 (or back) does
-// not brick the device. Regenerate with: node tools/gen_root_ca.js
+// Multiple publicly trusted roots are included to tolerate CDN CA variation;
+// validate the active hostname chain on a live device before shipping.
 static const char LUCY_ROOT_CA[] =
 R"LUCA(${body})LUCA";
 `;

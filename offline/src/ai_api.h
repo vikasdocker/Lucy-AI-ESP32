@@ -20,7 +20,7 @@ void aiSetModel(const char *model);
 void aiSetLanguage(uint8_t language);
 // Sent as x-lucy-token. Empty = no header (LAN Ollama ignores it anyway).
 void aiSetToken(const char *token);
-// Escape hatch: skip certificate verification if the CA ever changes.
+// Compatibility command; verification always remains enabled.
 void aiSetInsecureTls(bool insecure);
 
 const char *aiUrl();
@@ -33,7 +33,7 @@ size_t aiTokenLength();
 bool aiUsesTls();
 
 // Sends one chat turn (with a short rolling history).
-// Returns a static reply buffer, or nullptr on any failure.
+// Starts a background request; returns nullptr immediately. Poll for completion.
 // Failures trigger a 30 s circuit breaker so chat stays snappy when the
 // server is down.
 const char *aiReply(const char *text);
@@ -47,6 +47,8 @@ int aiLastStatus();
 
 // Forget the circuit breaker (e.g. after the user fixes the network).
 void aiClearRetry();
-// Called on the UI task while a separate network task waits for a chat reply.
-// Must not reenter WebServer, chat, serial parsing, or AI configuration.
+// Retained for source compatibility; background requests no longer wait on UI.
 void aiSetIdleHook(void (*hook)());
+
+const char *aiPollReply(const char **text);
+bool aiBusy();

@@ -2,10 +2,10 @@
 #include "cat_animation.h"
 
 namespace companion_ui {
-constexpr uint8_t SETTINGS_COUNT = 9;
+constexpr uint8_t SETTINGS_COUNT = 7;
 static const char *const SETTINGS[] = {
   "Brightness", "Language", "Speaker volume", "Wi-Fi", "Access point",
-  "AI model", "MCP setup", "Info", "Apps"
+  "Info", "Apps"
 };
 // The production display and native render harness use these same functions.
 template<class D> void centered(D &d, const char *text, int y) {
@@ -34,7 +34,7 @@ template<class D> void settings(D &d, uint8_t index, const uint8_t *font,
   d.setFont(titleFont);
   d.drawStr(3, 9, "SETTINGS");
   d.setFont(font);
-  char page[] = "1/9";
+  char page[] = "1/7";
   page[0] += index;
   d.drawStr(109, 9, page);
   for (int row = 0; row < 3; row++) {

@@ -20,7 +20,7 @@ Target: classic ESP32 DevKit / ESP32-WROOM-32 (`esp32dev`).
 
 Connect your phone to the ESP32 setup AP, open the dashboard, choose **Wi-Fi settings**, scan for networks, select the SSID, enter its password and save. The credentials are stored in ESP32 NVS. The setup AP remains available while the ESP32 connects to the router. If no credentials have been saved, a captive DNS portal directs common captive-network checks to the dashboard.
 
-The phone's connection to the ESP32 AP does not automatically provide internet routing through the ESP32. AI requests are made by the phone's browser to the HTTPS Cloudflare Worker; phone/carrier routing behavior while connected to a no-internet AP can vary.
+Chat uses a local ESP32 proxy: the ESP32 reaches the Cloudflare Worker through the saved router Wi-Fi. A phone on Lucy's hotspot does not need its own internet connection. A privately provisioned firmware credential and matching Worker secret are required; public CI images provide offline behavior only.
 
 ## Live system log monitor
 
@@ -43,12 +43,8 @@ The upload page remains at `/update`, uses `POST /update`, and sends the multipa
 
 The artifact also includes `SHA256SUMS.txt` for integrity verification.
 
-## OpenRouter / Cloudflare backend
+## Cloudflare / OpenAI backend
 
-Deploy `worker/worker.js` as a Cloudflare Worker. In Cloudflare Worker → Settings → Variables and Secrets, add a **Secret** named `OPENROUTER_API_KEY`. Do not commit the key to GitHub, put it in the web page, or embed it in firmware.
+Lucy uses the fixed Worker `https://sparkling-fog-fdc8.vikasshu7.workers.dev` and `gpt-4o-mini`. Users only enter Wi-Fi credentials; AI URL/model/provider controls are absent. The OpenAI key stays in the Worker secret `OPENAI_API_KEY`. Firmware uses a separate private device token, never a provider key. Public GitHub firmware artifacts deliberately omit this credential.
 
-Optional: add a plain-text variable `OPENROUTER_MODEL` to choose a model available to your OpenRouter account. The Worker calls `https://openrouter.ai/api/v1/chat/completions`.
-
-In Lucy AI → AI settings, save the deployed HTTPS Worker URL. Use exactly one `https://` prefix.
-
-The Worker currently allows browser origins `http://192.168.4.1` and `http://edsoft.local`. CORS is not authentication. Before exposing this beyond personal testing, add authenticated sessions/device tokens, rate limiting and usage budgets.
+See [the provisioning, security and rollout guide](worker/ZERO_CONFIG.md) for private builds, authenticated API formats, verified TLS, offline fallback and approval-gated deployment. No device flashing or production Worker deployment is automatic. The older optional `gateway/` utilities are not part of the default cloud path.

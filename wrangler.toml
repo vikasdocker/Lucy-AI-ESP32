@@ -1,4 +1,15 @@
-name = "lucy-ai-esp32-api"
+name = "sparkling-fog-fdc8"
 main = "worker/worker.js"
 compatibility_date = "2026-11-10"
 workers_dev = true
+
+[vars]
+OPENAI_MODEL = "gpt-4o-mini"
+
+[[ratelimits]]
+name = "LUCY_RATE_LIMITER"
+namespace_id = "1001"
+
+[ratelimits.simple]
+limit = 12
+period = 60

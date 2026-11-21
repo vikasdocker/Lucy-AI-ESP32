@@ -1,4 +1,9 @@
 #include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <time.h>
+#include "clipbot_tts_ca.h"
 #include "board_config.h"
 #include "speaker.h"
 #include "cat_animation.h"
@@ -123,5 +128,67 @@ void speakerTick() {
     if (!written) break;
   }
   }
+#endif
+}
+
+bool speakerSpeakPcm16Url(const String& url, const String& token) {
+#if LUCY_I2S_DIN >= 0
+  if (!ready || volume == 0 || WiFi.status() != WL_CONNECTED) return false;
+  WiFiClient client;
+  WiFiClientSecure secure;
+  HTTPClient http;
+  http.setConnectTimeout(3500);
+  http.setTimeout(7000);
+  const bool tls = url.startsWith("https://");
+  if (tls) {
+    if (time(nullptr) < 1700000000) {
+      Serial.println("Clipbot TTS: system clock not synchronized; refusing HTTPS");
+      return false;
+    }
+    secure.setCACert(CLIPBOT_TTS_CA);
+    if (!http.begin(secure, url)) return false;
+  } else if (url.startsWith("http://")) {
+    if (!http.begin(client, url)) return false;
+  } else return false;
+  if (token.length()) http.addHeader("X-Clipbot-Token", token);
+  const int status = http.GET();
+  const int length = http.getSize();
+  if (status != 200 || length <= 0 || length > 1024000 || (length % 2)) {
+    Serial.printf("Clipbot TTS HTTP error: %d / size: %d\n", status, length);
+    http.end();
+    return false;
+  }
+  // Stop cat effect buffers before streaming actual speech.
+  remaining = 0;
+  pending = sent = 0;
+  i2s_zero_dma_buffer(I2S_NUM_0);
+  WiFiClient* stream = http.getStreamPtr();
+  uint8_t mono[512];
+  int16_t stereo[512];
+  int left = length;
+  bool ok = true;
+  while (left > 0) {
+    int chunk = left > int(sizeof(mono)) ? sizeof(mono) : left;
+    const size_t read = stream->readBytes(reinterpret_cast<char*>(mono), chunk);
+    if (read != size_t(chunk)) { ok = false; break; }
+    const int frames = chunk / 2;
+    for (int i = 0; i < frames; ++i) {
+      const int16_t sample = int16_t(uint16_t(mono[2*i]) | (uint16_t(mono[2*i+1]) << 8));
+      // Similar conservative digital gain as existing cat sounds.
+      const int16_t scaled = int16_t(int32_t(sample) * volume / 200);
+      stereo[2*i] = scaled;
+      stereo[2*i+1] = scaled;
+    }
+    size_t written = 0;
+    if (i2s_write(I2S_NUM_0, stereo, frames * 4, &written, pdMS_TO_TICKS(2500)) != ESP_OK ||
+        written != size_t(frames * 4)) { ok = false; break; }
+    left -= chunk;
+  }
+  i2s_zero_dma_buffer(I2S_NUM_0);
+  http.end();
+  return ok && left == 0;
+#else
+  (void)url;
+  return false;
 #endif
 }

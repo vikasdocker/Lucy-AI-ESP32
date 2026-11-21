@@ -13,9 +13,10 @@ import sys
 root = Path(__file__).resolve().parent.parent
 build = root / 'offline/.pio/host-qa'
 build.mkdir(parents=True, exist_ok=True)
-libs = root / 'offline/.pio/libdeps/lucy_c3_mini'
+env = os.environ.get('LUCY_TEST_ENV', 'lucy_c3_mini')
+libs = root / 'offline/.pio/libdeps' / env
 clib = libs / 'U8g2/src/clib'
-assert clib.exists(), 'Run pio run -e lucy_c3_mini in offline/ first'
+assert clib.exists(), f'Run pio run -e {env} in offline/ first'
 if importlib.util.find_spec('ziglang'):
     cc = [sys.executable, '-m', 'ziglang', 'cc']
     cxx = [sys.executable, '-m', 'ziglang', 'c++']

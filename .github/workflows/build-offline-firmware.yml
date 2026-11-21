@@ -2,10 +2,18 @@ name: Build Lucy Offline OS firmware
 
 on:
   push:
-    branches: [ offline-os-v1 ]
+    branches: [ offline-os-v1, "clipbot/**" ]
     paths:
       - "offline/**"
+      - "tools/gen_root_ca.js"
+      - "tools/build_security.py"
       - "tools/test_companion*"
+      - ".github/workflows/build-offline-firmware.yml"
+  pull_request:
+    paths:
+      - "offline/**"
+      - "tools/gen_root_ca.js"
+      - "tools/build_security.py"
       - ".github/workflows/build-offline-firmware.yml"
   workflow_dispatch:
 
@@ -22,6 +30,8 @@ jobs:
             name: lucy-cat-c3-mini
           - environment: lucy_offline
             name: lucy-cat-esp32dev
+          - environment: lucy_clipbot_c3
+            name: lucy-clipbot-c3
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,12 +43,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install platformio==6.2.0 pillow
+      - name: Refresh Worker TLS root CA trust for Clipbot
+        if: matrix.environment == 'lucy_clipbot_c3'
+        run: node tools/gen_root_ca.js sparkling-fog-fdc8.vikasshu7.workers.dev
       - name: Build offline firmware
         working-directory: offline
         run: pio run -e ${{ matrix.environment }}
       - name: Verify C3 animation renderer and MCP protocol
-        if: matrix.environment == 'lucy_c3_mini'
+        if: matrix.environment == 'lucy_c3_mini' || matrix.environment == 'lucy_clipbot_c3'
         run: python tools/test_companion.py
+        env:
+          LUCY_TEST_ENV: ${{ matrix.environment }}
       - name: Stage firmware
         run: |
           mkdir -p release
@@ -46,7 +61,11 @@ jobs:
           cp offline/.pio/build/${{ matrix.environment }}/bootloader.bin release/bootloader.bin
           cp offline/.pio/build/${{ matrix.environment }}/partitions.bin release/partitions.bin
           cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin release/boot_app0.bin
-          cp offline/C3_MINI.md release/READ-ME.md
+          if [ "${{ matrix.environment }}" = "lucy_clipbot_c3" ]; then
+            cp offline/CLIPBOT_C3.md release/READ-ME.md
+          else
+            cp offline/C3_MINI.md release/READ-ME.md
+          fi
           if [ "${{ matrix.environment }}" = "lucy_c3_mini" ]; then
             python ~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32c3 merge_bin -o release/${{ matrix.name }}-usb.bin --flash_mode dio --flash_size 4MB 0x0 release/bootloader.bin 0x8000 release/partitions.bin 0xe000 release/boot_app0.bin 0x10000 release/${{ matrix.name }}-app.bin
           fi

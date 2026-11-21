@@ -22,16 +22,11 @@ button{padding:14px 24px;border:0;border-radius:12px;background:#a8e6cf;font-siz
 <label>Password <input name="ap_password" type="password" minlength="8" maxlength="63" autocomplete="new-password" placeholder="Leave blank to keep current password"></label>
 <label><input type="checkbox" name="ap_open"> Use an open setup network</label>
 <small>Reconnect after changing these settings. The physical button can enable the access point again.</small>
-</fieldset><fieldset><legend>AI model</legend>
-<label><input type="checkbox" name="ai_enabled"> Use model server (offline fallback stays available)</label>
-<label>Ollama or Lucy gateway URL <input name="ai_url" maxlength="95" required></label>
-<label>Model name <input name="ai_model" maxlength="39" required></label>
-<label>Gateway token <input name="ai_token" type="password" maxlength="95" autocomplete="new-password" placeholder="Leave blank to keep saved token"></label>
-<small>The model runs on your server. A gateway may enforce its own model name. All model downloads happen on the server.</small>
-</fieldset><fieldset><legend>MCP setup</legend>
-<label><input type="checkbox" name="mcp_enabled"> Enable Lucy's read-only MCP server</label>
-<label>Bearer token (24-95 characters) <input name="mcp_token" type="password" minlength="24" maxlength="95" autocomplete="new-password" placeholder="Leave blank to keep saved token"></label>
-<small>Local endpoint: http://192.168.4.1/mcp (or Lucy's router IP). Tools: lucy_status and lucy_animations. Configure this endpoint and Bearer token in a local MCP client. External MCP services need a separate host/bridge.</small>
+</fieldset><fieldset><legend>Clipbot speech (ESP speaker)</legend>
+<label><input type="checkbox" name="tts_enabled"> Speak text replies through MAX98357A</label>
+<label>TTS server URL (local HTTP or remote HTTPS) <input name="tts_url" maxlength="95" placeholder="https://voice.example.com"></label>
+<label>Remote TTS access token <input name="tts_token" type="password" maxlength="95" placeholder="Leave blank to keep saved token"></label>
+<small>Use a local TTS service or a remote HTTPS service with a certificate chaining to ISRG Root X1. Requires 16 kHz mono signed 16-bit PCM and Content-Length. Remote access should require a token. This is independent of the AI model URL.</small>
 </fieldset><button>Save settings</button></form><p><a href="/">Back to Lucy</a></p>
 <script>
 const form=document.querySelector('form'), status=document.querySelector('#status');

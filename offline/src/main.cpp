@@ -9,9 +9,15 @@
 #include <string.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#if defined(LUCY_CLIPBOT_C3)
+#include <Update.h>
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
+#endif
 #include <ArduinoJson.h>
 
 #include "ai_api.h"
+#include "lucy_cloud_config.h"
 #include "intent_api.h"
 #include "markov_api.h"
 #include "board_config.h"
@@ -32,7 +38,11 @@ static constexpr uint8_t PIN_SD_CS = 13; // avoids GPIO5 boot-strapping interact
 static constexpr uint32_t DEBOUNCE_MS = 35;
 static constexpr uint32_t IDLE_RETURN_MS = 15000;
 
+#if defined(LUCY_CLIPBOT_C3)
+U8G2_SH1106_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
+#else
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
+#endif
 RTC_DS3231 rtc;
 Preferences prefs;
 
@@ -77,6 +87,23 @@ uint8_t gameIndex = 0;
 uint32_t lastInteraction = 0;
 uint32_t lastFrame = 0;
 uint32_t lastClockSync = 0;
+#if defined(LUCY_CLIPBOT_C3)
+// Low-duty-cycle synthetic cat voice; no microphone or general speech synthesis.
+uint32_t nextCatSoundAt = 0;
+String clipbotTtsBase;
+String clipbotTtsToken;
+bool clipbotTtsOn = false;
+char clipbotSpeechQueue[192] = {};
+
+bool clipbotNetworkReady = false;
+String clipbotOtaPassword;
+bool clipbotOtaAuthorized = false;
+bool clipbotOtaSuccess = false;
+bool clipbotOtaUploading = false;
+bool clipbotOtaReboot = false;
+uint32_t clipbotOtaRebootAt = 0;
+uint32_t clipbotOtaBytes = 0;
+#endif
 uint16_t snakeScore = 0;
 uint8_t snakeX[48], snakeY[48], snakeLength = 3;
 int8_t snakeDx = 1, snakeDy = 0;
@@ -494,7 +521,9 @@ void saveSettings() {
   prefs.putString("aiHost", aiUrl());
   prefs.putUShort("aiPort", 0);
   prefs.putString("aiModel", aiModel());
+#if !defined(LUCY_CLIPBOT_C3)
   prefs.putString("aiTok", aiToken());
+#endif
   prefs.putBool("aiIns", aiInsecure());
   prefs.putString("wifiSsid", wifiSsid);
   prefs.putString("wifiPass", wifiPass);
@@ -506,6 +535,11 @@ void saveSettings() {
   prefs.putUChar("volume", volume);
   prefs.putBool("mcpOn", mcpEnabled);
   prefs.putString("mcpTok", mcpToken);
+#if defined(LUCY_CLIPBOT_C3)
+  prefs.putString("ttsUrl", clipbotTtsBase);
+  prefs.putString("ttsToken", clipbotTtsToken);
+  prefs.putBool("ttsOn", clipbotTtsOn);
+#endif
   display.setContrast(brightness * 255 / 100);
   speakerVolume(volume);
 }
@@ -514,7 +548,11 @@ void loadSettings() {
   uint8_t stored = prefs.getUChar("lang", 0);
   if (stored <= 2) language = static_cast<Language>(stored);
   soundEnabled = prefs.getBool("sound", false);
+#if defined(LUCY_CLIPBOT_C3)
+  aiEnabled = true;
+#else
   aiEnabled = prefs.getBool("aiOn", false);
+#endif
 
   String url = prefs.getString("aiUrl", "");
   if (url.length() == 0) {
@@ -539,10 +577,23 @@ void loadSettings() {
   brightness = constrain(prefs.getUChar("bright", 70), 10, 100);
   volume = constrain(prefs.getUChar("volume", soundEnabled ? 50 : 0), 0, 100);
   // A fresh C3 build with an amplifier starts at a moderate volume.
-  if (!prefs.isKey("volume") && !prefs.isKey("sound")) volume = 50;
+  if (!prefs.isKey("volume") && !prefs.isKey("sound")) volume = 35;
   soundEnabled = volume > 0;
   mcpToken = prefs.getString("mcpTok", "");
   mcpEnabled = prefs.getBool("mcpOn", false) && mcpToken.length() >= 24;
+#if defined(LUCY_CLIPBOT_C3)
+  clipbotOtaPassword = prefs.getString("otaPassword", "");
+  if (clipbotOtaPassword.length() < 16) {
+    char key[17];
+    snprintf(key, sizeof(key), "%08lX%08lX",
+             (unsigned long)esp_random(), (unsigned long)esp_random());
+    clipbotOtaPassword = key;
+    prefs.putString("otaPassword", clipbotOtaPassword);
+  }
+  clipbotTtsBase = prefs.getString("ttsUrl", "");
+  clipbotTtsToken = prefs.getString("ttsToken", "");
+  clipbotTtsOn = prefs.getBool("ttsOn", false);
+#endif
 }
 
 void pollButton(Button &button) {
@@ -590,10 +641,88 @@ void showHome() {
   display.sendBuffer();
 }
 
+#if defined(LUCY_CLIPBOT_C3)
+// Keep cat sounds silent during Wi-Fi station connection and reconnection.
+// When no station is configured, the local Lucy-Setup AP can run independently.
+bool clipbotCanSpeak() {
+  if (!clipbotNetworkReady || !speakerReady() || !volume) return false;
+  if (wifiEnabled && wifiSsid.length()) return WiFi.status() == WL_CONNECTED;
+  return true;
+}
+
+// Align a real Lucy facial animation with its synthesized cat voice.
+void clipbotVocalize(bool reply) {
+  if (!clipbotCanSpeak() || speakerBusy()) return;
+  static const uint8_t voices[] = {cat::MEOW, cat::CHIRP, cat::PURR, cat::CHATTER};
+  uint8_t behaviour = reply ? (millis() % 2 ? cat::MEOW : cat::CHIRP)
+                            : voices[random(0, 4)];
+  uint8_t variant = random(0, cat::VARIANTS);
+  // Responding to chat should not permanently disable autonomous animation.
+  if (screen == Screen::HOME) {
+    catPlayer.clip = behaviour * cat::VARIANTS + variant;
+    catPlayer.started = millis();
+    catPlayer.automatic = true;
+    showHome();
+  }
+  speakerCat(behaviour, variant);
+  nextCatSoundAt = millis() + random(9000, 17000);
+}
+#endif
+
+#if defined(LUCY_CLIPBOT_C3)
+static String clipbotEncodeText(const char* input) {
+  const char* hex = "0123456789ABCDEF";
+  String out;
+  out.reserve(strlen(input) * 3);
+  for (const unsigned char* p = reinterpret_cast<const unsigned char*>(input); *p; ++p) {
+    const uint8_t c = *p;
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~')
+      out += char(c);
+    else { out += '%'; out += hex[c >> 4]; out += hex[c & 15]; }
+  }
+  return out;
+}
+
+static void clipbotQueueSpeech(const char* message) {
+  if (!message || !*message) return;
+  strncpy(clipbotSpeechQueue, message, sizeof(clipbotSpeechQueue) - 1);
+  clipbotSpeechQueue[sizeof(clipbotSpeechQueue) - 1] = 0;
+}
+
+static void clipbotServiceSpeech() {
+  if (!clipbotSpeechQueue[0]) return;
+  char text[sizeof(clipbotSpeechQueue)];
+  strcpy(text, clipbotSpeechQueue);
+  clipbotSpeechQueue[0] = 0;
+  if (!clipbotTtsOn || !(clipbotTtsBase.startsWith("http://") || clipbotTtsBase.startsWith("https://")) ||
+      !clipbotCanSpeak()) {
+    Serial.println("Clipbot: reply shown on OLED; speech gateway disabled/unreachable.");
+    return;
+  }
+  String url = clipbotTtsBase;
+  if (url.endsWith("/")) url.remove(url.length()-1);
+  url += "/tts?text=";
+  url += clipbotEncodeText(text);
+  const bool success = speakerSpeakPcm16Url(url, clipbotTtsToken);
+  Serial.println(success ? "Clipbot: spoken reply complete" :
+                "Clipbot: speech failed; reply remains visible on OLED");
+}
+#endif
+
 void serviceCompanion() {
   speakerTick();
+#if defined(LUCY_CLIPBOT_C3)
+  // Lucy continues silent animations even before Wi-Fi is connected.
+  catPlayer.tick(millis());
+  if (screen == Screen::HOME && clipbotCanSpeak() && !speakerBusy() &&
+      int32_t(millis() - nextCatSoundAt) >= 0) {
+    clipbotVocalize(false);
+  }
+#else
   if (catPlayer.tick(millis()) && screen == Screen::HOME)
     speakerCat(catPlayer.clip / cat::VARIANTS, catPlayer.clip % cat::VARIANTS);
+#endif
   if (screen == Screen::HOME && millis() - lastFrame >= 80) {
     lastFrame = millis();
     showHome();
@@ -692,7 +821,7 @@ void showCompanion(const char *message = nullptr) {
   }
   display.setFont(FONT_META);
   if (!message && hasChat) {
-    display.drawStr(3, 62, lastReplyFromModel ? "from PC model" : "offline brain");
+    display.drawStr(3, 62, lastReplyFromModel ? "from cloud" : "offline brain");
   } else if (!message) {
     display.drawStr(3, 62, "UP lang SEL demo");
   }
@@ -794,12 +923,7 @@ void handleSettingsButtons() {
           break;
         case 3: wifiEnabled = !wifiEnabled; break;
         case 4: apEnabled = !apEnabled; break;
-        case 5:
-          modelChoice = (modelChoice + 1) % 5;
-          aiEnabled = modelChoice != 0;
-          if (aiEnabled) aiSetModel(modelChoice == 1 ? savedModel.c_str() : MODEL_CHOICES[modelChoice]);
-          break;
-        case 6: if (mcpToken.length() >= 24) mcpEnabled = !mcpEnabled; break;
+
       }
       // Commit on save/back instead of writing flash on each tap.
       display.setContrast(brightness * 255 / 100);
@@ -812,8 +936,8 @@ void handleSettingsButtons() {
       if (settingsIndex == 3 || settingsIndex == 4) networkApplyAt = millis() + 500;
       settingDetail = false;
     }
-    else if (settingsIndex == 7) { screen = Screen::ABOUT; showAbout(); return; }
-    else if (settingsIndex == 8) { screen = Screen::MENU; menuIndex = 0; showMenu(); return; }
+    else if (settingsIndex == 5) { screen = Screen::ABOUT; showAbout(); return; }
+    else if (settingsIndex == 6) { screen = Screen::MENU; menuIndex = 0; showMenu(); return; }
     else settingDetail = true;
     showSettings();
   }
@@ -988,6 +1112,16 @@ const char *offlineReply(const char *input) {
   for (size_t i = 0; i < n; i++) normalized[i] = static_cast<char>(tolower(static_cast<unsigned char>(input[i])));
   normalized[n] = '\0';
 
+#if defined(LUCY_CLIPBOT_C3)
+  // The Cloudflare Worker is Clipbot's online brain.
+  if (aiEnabled) {
+    const char *reply = aiReply(input);
+    if (reply != nullptr) {
+      lastReplyFromModel = true;
+      return reply;
+    }
+  }
+#endif
   // Self-learning generator is always local and always wins.
   if (textHasWord(normalized, "generate") || textHasWord(normalized, "invent") ||
       strstr(normalized, "make words") || strstr(normalized, "new words") ||
@@ -1006,8 +1140,8 @@ const char *offlineReply(const char *input) {
     return "Use the serial console for brain commands: brain stats, save, reset.";
   }
 
-  // PC-hosted model (Ollama). Falls through to the offline brain if disabled,
-  // unreachable, or in its retry backoff window.
+#if !defined(LUCY_CLIPBOT_C3)
+  // Other Lucy targets retain their existing Ollama-compatible transport.
   if (aiEnabled) {
     const char *ai = aiReply(input);
     if (ai != nullptr) {
@@ -1016,6 +1150,7 @@ const char *offlineReply(const char *input) {
     }
   }
 
+#endif
   if (strstr(normalized, "hello") || textHasWord(normalized, "hi") || textHasWord(normalized, "hey") || strstr(normalized, "namaste") || strstr(normalized, "namaskar")) {
     if (language == Language::HINDI) return "Namaste! Aap kaise hain?";
     if (language == Language::MARATHI) return "Namaskar! Kase aahat?";
@@ -1100,8 +1235,13 @@ void handleAiCommand(const char *line) {
     Serial.println(aiEnabled ? "on" : "off");
     Serial.print("  endpoint: ");
     Serial.println(aiUrl());
+#if defined(LUCY_CLIPBOT_C3)
+    Serial.println("  online brain: Cloudflare Worker (/api/chat)");
+    Serial.println("  AI model: configured on Worker");
+#else
     Serial.print("  model:    ");
     Serial.println(aiModel());
+#endif
     Serial.print("  token:    ");
     if (aiTokenLength() > 0) {
       Serial.print(aiTokenLength());
@@ -1131,7 +1271,11 @@ void handleAiCommand(const char *line) {
     aiEnabled = true;
     aiClearRetry();
     saveSettings();
+#if defined(LUCY_CLIPBOT_C3)
+    Serial.println("AI on: OpenCode bridge online, local fallback if unavailable.");
+#else
     Serial.println("AI: on. Chat uses the PC model when reachable, local brain otherwise.");
+#endif
   } else if (strcmp(line, "AI off") == 0) {
     aiEnabled = false;
     saveSettings();
@@ -1171,8 +1315,12 @@ void handleAiCommand(const char *line) {
     aiSetModel(line + 9);
     aiClearRetry();
     saveSettings();
+#if defined(LUCY_CLIPBOT_C3)
+    Serial.println("Clipbot model selection is managed by OpenCode bridge config.json.");
+#else
     Serial.print("AI: model ");
     Serial.println(aiModel());
+#endif
   } else {
     Serial.println("AI: AI | AI on|off | AI url <http(s)://...> | AI host <ip> [port]");
     Serial.println("    AI token <secret> | AI insecure on|off | AI model <name>");
@@ -1318,6 +1466,11 @@ void handleSerialConsole() {
           const char *reply = offlineReply(serialLine);
           setChat(serialLine, reply);
           Serial.print("Lucy: "); Serial.println(reply);
+#if defined(LUCY_CLIPBOT_C3)
+          screen = Screen::COMPANION;
+          lastInteraction = millis();
+          clipbotQueueSpeech(reply);
+#endif
           if (screen == Screen::COMPANION) showCompanion();
         }
       }
@@ -1382,10 +1535,14 @@ render(new Uint8Array(1024));
 document.getElementById('up').onclick=function(){fetch('/press?btn=up');};
 document.getElementById('select').onclick=function(){fetch('/press?btn=select');};
 document.getElementById('back').onclick=function(){fetch('/press?btn=back');};
-form.onsubmit=function(e){e.preventDefault();var t=msg.value.trim();if(!t)return;say('You',t);msg.value='';fetch('/say?text='+encodeURIComponent(t)).then(function(r){return r.text();}).then(function(t){say('Lucy',t);}).catch(function(){say('Lucy','(no reply)');});};
+form.onsubmit=function(e){e.preventDefault();var t=msg.value.trim();if(!t)return;say('You',t);msg.value='';fetch('/say?text='+encodeURIComponent(t)).then(async function(r){while(r.status===202){await new Promise(function(resolve){setTimeout(resolve,250);});r=await fetch('/chat-result');}if(!r.ok)throw Error('busy');return r.text();}).then(function(t){say('Lucy',t);}).catch(function(){say('Lucy','(no reply)');});};
 </script>
 </body></html>)HTML";
 
+static void handleChatResult() {
+  if (aiBusy()) { webServer.send(202,"text/plain",""); return; }
+  webServer.send(200,"text/plain; charset=utf-8",chatReply);
+}
 static void handleWebRoot() { webServer.send_P(200, "text/html; charset=utf-8", WEB_PAGE); }
 
 static void handleWebFrame() {
@@ -1407,6 +1564,7 @@ static void handleWebPress() {
 }
 
 static void handleWebSay() {
+  if (aiBusy()) { webServer.send(409, "text/plain", "Lucy is thinking."); return; }
   String text = webServer.arg("text");
   text.trim();
   if (text.isEmpty()) { webServer.send(400, "text/plain", "empty"); return; }
@@ -1414,13 +1572,24 @@ static void handleWebSay() {
   markovLearn(text.c_str()); // same learning path as the serial console
   const char *reply = offlineReply(text.c_str());
   setChat(text.c_str(), reply);
-  webServer.send(200, "text/plain; charset=utf-8", reply);
+  webServer.send(aiBusy()?202:200, "text/plain; charset=utf-8", reply);
+#if defined(LUCY_CLIPBOT_C3)
+  screen = Screen::COMPANION;
+  lastInteraction = millis();
+  clipbotQueueSpeech(reply);
+#endif
   if (screen == Screen::COMPANION) showCompanion();
 }
 
 static void applyNetwork() {
   const bool sta = wifiEnabled && wifiSsid.length();
   WiFi.mode(apEnabled ? (sta ? WIFI_AP_STA : WIFI_AP) : (sta ? WIFI_STA : WIFI_OFF));
+#if defined(LUCY_CLIPBOT_C3)
+  // Preserve the TX-power setting used by the tested Clipbot Wi-Fi firmware.
+  if (apEnabled || sta) {
+    if (!WiFi.setTxPower(WIFI_POWER_8_5dBm)) Serial.println("Clipbot: Wi-Fi TX power setting failed");
+  }
+#endif
   if (apEnabled) WiFi.softAP(apSsid.c_str(), apPass.length() ? apPass.c_str() : nullptr);
   if (sta) {
     WiFi.setAutoReconnect(true);
@@ -1456,10 +1625,16 @@ static void handleSettingsGet() {
   doc["ap_enabled"] = apEnabled;
   doc["ap_ssid"] = apSsid;
   doc["ap_open"] = apPass.isEmpty();
+#if !defined(LUCY_CLIPBOT_C3)
   doc["ai_enabled"] = aiEnabled;
   doc["ai_url"] = aiUrl();
   doc["ai_model"] = aiModel();
   doc["mcp_enabled"] = mcpEnabled;
+#endif
+#if defined(LUCY_CLIPBOT_C3)
+  doc["tts_enabled"] = clipbotTtsOn;
+  doc["tts_url"] = clipbotTtsBase;
+#endif
   String json;
   serializeJson(doc, json);
   webServer.send(200, "application/json", json);
@@ -1490,10 +1665,22 @@ static void handleSettingsSave() {
   const bool nextWifiOn = webServer.arg("wifi_enabled") == "1";
   const bool nextApOn = webServer.arg("ap_enabled") == "1";
   const bool nextMcpOn = webServer.arg("mcp_enabled") == "1";
+#if defined(LUCY_CLIPBOT_C3)
+  String nextTtsUrl = webServer.arg("tts_url");
+  String nextTtsToken = webServer.arg("tts_token");
+  const bool nextTtsOn = webServer.arg("tts_enabled") == "1";
+  if ((nextTtsOn && !(nextTtsUrl.startsWith("http://") || nextTtsUrl.startsWith("https://"))) ||
+      nextTtsToken.length() > 95 || nextTtsUrl.length() > 95 ||
+      nextTtsUrl.indexOf('@') >= 0 || nextTtsUrl.indexOf('?') >= 0 ||
+      nextTtsUrl.indexOf('#') >= 0 || nextTtsUrl.indexOf(' ') >= 0) {
+    invalid("TTS requires a local HTTP URL without query or credentials."); return;
+  }
+#endif
   if (nextSsid.length() > 32 || nextAp.length() < 1 || nextAp.length() > 32 ||
       nextPass.length() > 64 || nextApPass.length() > 63 ||
       (nextApPass.length() > 0 && nextApPass.length() < 8) ||
       (nextWifiOn && !nextSsid.length())) { invalid("Check network names and password lengths."); return; }
+#if !defined(LUCY_CLIPBOT_C3)
   if ((!nextUrl.startsWith("http://") && !nextUrl.startsWith("https://")) ||
       nextUrl.length() > 95 || nextUrl.indexOf('@') >= 0 || nextUrl.indexOf('?') >= 0 ||
       nextUrl.indexOf('#') >= 0 || nextUrl.indexOf(' ') >= 0 ||
@@ -1507,6 +1694,7 @@ static void handleSettingsSave() {
   for (size_t i = 0; i < nextMcp.length(); i++) {
     if (nextMcp[i] <= 32 || nextMcp[i] >= 127) { invalid("Use visible non-space ASCII in the MCP token."); return; }
   }
+#endif
   // Validate everything before changing any state. Blank secrets preserve NVS.
   if (!nextPass.length()) nextPass = wifiPass;
   if (webServer.arg("wifi_open") == "1") nextPass = "";
@@ -1520,12 +1708,26 @@ static void handleSettingsSave() {
   language = static_cast<Language>(nextLanguage);
   wifiSsid = nextSsid; wifiPass = nextPass; wifiEnabled = nextWifiOn;
   apSsid = nextAp; apPass = nextApPass; apEnabled = nextApOn;
+#if defined(LUCY_CLIPBOT_C3)
+  aiEnabled = true;
+  aiSetUrl(LUCY_WORKER_URL);
+  aiSetModel("gpt-4o-mini");
+  aiSetToken(LUCY_DEVICE_TOKEN);
+#else
   aiEnabled = webServer.arg("ai_enabled") == "1";
   aiSetUrl(nextUrl.c_str()); aiSetModel(nextModel.c_str());
+#endif
   savedModel = nextModel; modelChoice = aiEnabled ? 1 : 0;
+#if !defined(LUCY_CLIPBOT_C3)
   if (nextToken.length()) aiSetToken(nextToken.c_str());
   if (nextMcp.length()) mcpToken = nextMcp;
   mcpEnabled = nextMcpOn;
+#endif
+#if defined(LUCY_CLIPBOT_C3)
+  clipbotTtsBase = nextTtsUrl;
+  if (nextTtsToken.length()) clipbotTtsToken = nextTtsToken;
+  clipbotTtsOn = nextTtsOn;
+#endif
   saveSettings();
   webServer.send(200, "text/plain", networkChanged ? "Saved. Rejoin Lucy's access point if the network changes." : "Settings saved.");
   if (networkChanged) networkApplyAt = millis() + 700;
@@ -1579,6 +1781,82 @@ static void handleMcp() {
   webServer.send(200, "application/json", json);
 }
 
+
+#if defined(LUCY_CLIPBOT_C3)
+static bool clipbotOtaAuth() {
+  if (clipbotOtaPassword.length() >= 16 &&
+      webServer.authenticate("clipbot", clipbotOtaPassword.c_str())) return true;
+  webServer.requestAuthentication();
+  return false;
+}
+static const char CLIPBOT_OTA_PAGE[] PROGMEM = R"HTML(
+<!doctype html><html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Clipbot OTA</title><style>body{max-width:480px;margin:30px auto;padding:20px;background:#10151b;color:white;font:16px system-ui}
+button,input{margin:12px 0;font-size:16px}button{padding:12px;background:#76dbce;border:0;border-radius:8px}progress{width:100%}</style>
+<h2>Clipbot firmware update</h2><p>Use only a compatible ESP32-C3 application .bin.
+Do not upload merged USB firmware or partition/bootloader images.</p>
+<form id="f"><input type="file" name="firmware" accept=".bin" required><button>Update</button></form>
+<progress max="100" value="0" id="p"></progress><p id="s">Ready</p>
+<script>document.getElementById('f').onsubmit=function(e){e.preventDefault();
+let file=this.querySelector('input').files[0];if(!file||!file.name.toLowerCase().endsWith('.bin'))return;
+let data=new FormData();data.append('firmware',file);let x=new XMLHttpRequest();
+x.open('POST','/ota/update');x.upload.onprogress=e=>{if(e.lengthComputable)document.getElementById('p').value=e.loaded*100/e.total};
+x.onload=()=>document.getElementById('s').textContent=x.responseText;
+x.onerror=()=>document.getElementById('s').textContent='Connection interrupted; check device after reboot';
+document.getElementById('s').textContent='Uploading';x.send(data)};</script></html>
+)HTML";
+static void clipbotOtaPage() {
+  if (!clipbotOtaAuth()) return;
+  if (!esp_ota_get_next_update_partition(nullptr)) {
+    webServer.send(409, "text/plain", "Installed partition table has no OTA slot; cannot update over Web OTA.");
+    return;
+  }
+  webServer.send_P(200, "text/html; charset=utf-8", CLIPBOT_OTA_PAGE);
+}
+static void clipbotOtaPost() {
+  if (!clipbotOtaAuthorized) { clipbotOtaAuth(); return; }
+  if (clipbotOtaSuccess && !Update.hasError()) {
+    webServer.send(200, "text/plain", "Update accepted. Rebooting...");
+    clipbotOtaReboot = true;
+    clipbotOtaRebootAt = millis();
+  } else webServer.send(500, "text/plain", "Update failed; check serial log.");
+  clipbotOtaAuthorized = false;
+}
+static void clipbotOtaUpload() {
+  HTTPUpload& u = webServer.upload();
+  if (u.status == UPLOAD_FILE_START) {
+    clipbotOtaAuthorized = clipbotOtaAuth();
+    clipbotOtaSuccess = false; clipbotOtaUploading = false; clipbotOtaBytes = 0;
+    if (!clipbotOtaAuthorized) return;
+    const esp_partition_t* next = esp_ota_get_next_update_partition(nullptr);
+    if (!next || !u.filename.endsWith(".bin") || !Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+      Serial.println("OTA: invalid file or partition");
+      Update.printError(Serial);
+      return;
+    }
+    clipbotOtaUploading = true;
+    Serial.printf("OTA: target slot capacity %lu bytes\n", (unsigned long)next->size);
+  } else if (u.status == UPLOAD_FILE_WRITE) {
+    if (!clipbotOtaAuthorized || !clipbotOtaUploading || Update.hasError()) return;
+    const esp_partition_t* next = esp_ota_get_next_update_partition(nullptr);
+    clipbotOtaBytes += u.currentSize;
+    if (!next || clipbotOtaBytes > next->size ||
+        Update.write(u.buf, u.currentSize) != u.currentSize) {
+      Serial.println("OTA write failed or image too large");
+      Update.abort(); clipbotOtaUploading = false;
+    }
+  } else if (u.status == UPLOAD_FILE_END) {
+    if (!clipbotOtaAuthorized || !clipbotOtaUploading || Update.hasError()) return;
+    clipbotOtaSuccess = Update.end(true);
+    clipbotOtaUploading = false;
+    if (!clipbotOtaSuccess) Update.printError(Serial);
+  } else if (u.status == UPLOAD_FILE_ABORTED) {
+    if (clipbotOtaUploading) Update.abort();
+    clipbotOtaUploading = false; clipbotOtaAuthorized = false;
+  }
+}
+#endif
+
 static void webConsoleBegin() {
   WiFi.persistent(false);
   applyNetwork();
@@ -1593,8 +1871,16 @@ static void webConsoleBegin() {
   webServer.on("/mcp", HTTP_ANY, handleMcp);
   webServer.on("/frame.bin", HTTP_GET, handleWebFrame);
   webServer.on("/press", HTTP_GET, handleWebPress);
+  webServer.on("/chat-result", HTTP_GET, handleChatResult);
   webServer.on("/say", HTTP_ANY, handleWebSay);
+#if defined(LUCY_CLIPBOT_C3)
+  webServer.on("/ota", HTTP_GET, clipbotOtaPage);
+  webServer.on("/ota/update", HTTP_POST, clipbotOtaPost, clipbotOtaUpload);
+#endif
   webServer.begin();
+#if defined(LUCY_CLIPBOT_C3)
+  clipbotNetworkReady = true;
+#endif
   Serial.println("Lucy web console: http://192.168.4.1 (when AP enabled)");
 }
 
@@ -1615,6 +1901,11 @@ static void wifiLoop() {
       Serial.print(" (");
       Serial.print(WiFi.RSSI());
       Serial.println(" dBm)");
+#if defined(LUCY_CLIPBOT_C3)
+      configTime(0, 0, "pool.ntp.org", "time.google.com");
+      // Play greeting only after station Wi-Fi is connected.
+      speakerGreeting();
+#endif
       aiClearRetry(); // let chat retry immediately
     } else {
       Serial.println("WiFi: connection lost; retrying in the background");
@@ -1647,12 +1938,21 @@ void setup() {
   prefs.begin("lucy-os", false);
   loadSettings();
   aiSetLanguage(static_cast<uint8_t>(language));
+#if defined(LUCY_CLIPBOT_C3)
+  aiEnabled = true;
+  aiSetUrl(LUCY_WORKER_URL);
+  aiSetModel("gpt-4o-mini");
+  aiSetToken(LUCY_DEVICE_TOKEN);
+  aiSetInsecureTls(false);
+#endif
   savedModel = aiModel();
   modelChoice = aiEnabled ? 1 : 0;
   display.setContrast(brightness * 255 / 100);
   speakerBegin(volume);
   battery.begin();
+#if !defined(LUCY_CLIPBOT_C3)
   speakerGreeting();
+#endif
   showBoot(1, 5);
 
   rtcReady = rtc.begin();
@@ -1698,16 +1998,36 @@ void setup() {
   Serial.println("AI: AI | AI on|off | AI url <http(s)://...> | AI host <ip> [port]");
   Serial.println("    AI token <secret> | AI insecure on|off | AI model <name>");
   Serial.println("WiFi: WIFI <ssid> [password] | WIFI status | WIFI off   (2.4 GHz only)");
-  // Keep the greeting visible/audible while completing actual initialization.
+  // Preserve the boot animation; Clipbot waits to greet until Wi-Fi connects.
   while (millis() - bootAt < 4300 || speakerBusy()) {
     speakerTick();
     if (millis() - lastFrame >= 80) { lastFrame = millis(); showBoot(5, 5); }
     delay(2);
   }
   catPlayer.started = millis();
+#if defined(LUCY_CLIPBOT_C3)
+  // Avoid overlapping the Wi-Fi-connected greeting with the first meow.
+  nextCatSoundAt = millis() + 7000;
+#endif
   screen = Screen::HOME;
   lastInteraction = millis();
   showHome();
+#if defined(LUCY_CLIPBOT_C3)
+  // Locally display the persistent OTA password during boot.
+  display.clearBuffer();
+  display.setFont(FONT_META);
+  display.drawStr(2, 10, "CLIPBOT OTA LOGIN");
+  display.drawStr(2, 23, "Username: clipbot");
+  display.drawStr(2, 36, "Password:");
+  display.drawStr(2, 49, clipbotOtaPassword.c_str());
+  display.drawStr(2, 62, "192.168.4.1/ota");
+  display.sendBuffer();
+  uint32_t t = millis();
+  while (millis() - t < 9500) {
+    speakerTick(); webConsoleLoop(); delay(5);
+  }
+  showHome();
+#endif
 }
 
 void handleRtcSetCommand(const char *line) {
@@ -1724,13 +2044,31 @@ void handleRtcSetCommand(const char *line) {
 }
 
 void loop() {
+  const char *completedText = nullptr;
+  const char *completedReply = aiPollReply(&completedText);
+  if (completedReply) {
+    lastReplyFromModel = true;
+    setChat(completedText, completedReply);
+    Serial.print("Lucy: "); Serial.println(completedReply);
+#if defined(LUCY_CLIPBOT_C3)
+    clipbotQueueSpeech(completedReply);
+#endif
+    if (screen == Screen::COMPANION) showCompanion();
+  }
   pollButton(btnUp);
   pollButton(btnSelect);
   pollButton(btnBack);
   handleSerialConsole();
   webConsoleLoop();
+#if defined(LUCY_CLIPBOT_C3)
+  if (clipbotOtaReboot && millis() - clipbotOtaRebootAt > 1200) ESP.restart();
+  if (clipbotOtaUploading || clipbotOtaReboot) { delay(1); return; }
+#endif
   wifiLoop();
   serviceCompanion();
+#if defined(LUCY_CLIPBOT_C3)
+  clipbotServiceSpeech();
+#endif
   battery.tick(millis());
   if (networkApplyAt && int32_t(millis() - networkApplyAt) >= 0) { networkApplyAt = 0; applyNetwork(); }
   // Flash writes are deferred until the speaker is idle.

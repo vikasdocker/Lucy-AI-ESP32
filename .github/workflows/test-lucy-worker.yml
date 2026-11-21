@@ -1,0 +1,30 @@
+name: Test Lucy Cloudflare Worker
+on:
+  push:
+    branches: [clipbot/zero-config-cloudflare]
+    paths:
+      - "worker/**"
+      - "tools/test_lucy_worker.mjs"
+      - "tools/test_device_token.mjs"
+      - "tools/write_device_token.js"
+      - "wrangler.toml"
+      - ".github/workflows/test-lucy-worker.yml"
+  pull_request:
+    paths:
+      - "worker/**"
+      - "tools/test_lucy_worker.mjs"
+      - "tools/test_device_token.mjs"
+      - "tools/write_device_token.js"
+      - "wrangler.toml"
+      - ".github/workflows/test-lucy-worker.yml"
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --check worker/worker.js
+      - run: node tools/test_lucy_worker.mjs
+      - run: node tools/test_device_token.mjs

@@ -3,9 +3,15 @@
 // ESP32-C3 Mini/SuperMini, 4 MB flash. GPIO18/19 stay free for native USB.
 // MAX98357A: DIN=3, BCLK=4, LRC=5. OLED: SDA=6, SCL=7.
 #if defined(CONFIG_IDF_TARGET_ESP32C3)
+#if defined(LUCY_CLIPBOT_C3)
+#define LUCY_BOARD_NAME "Clipbot ESP32-C3 Super Mini"
+#define LUCY_SDA 21
+#define LUCY_SCL 20
+#else
 #define LUCY_BOARD_NAME "ESP32-C3 Mini"
 #define LUCY_SDA 6
 #define LUCY_SCL 7
+#endif
 #define LUCY_BUTTON 10
 #define LUCY_BUTTON_UP -1
 #define LUCY_BUTTON_BACK -1

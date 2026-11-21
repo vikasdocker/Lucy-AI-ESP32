@@ -11,3 +11,9 @@ build/
 # Local logs
 *.log
 __pycache__/
+
+offline/src/lucy_device_config.h
+
+.pio/
+.wrangler/
+src/lucy_device_config.h
